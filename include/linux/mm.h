@@ -633,8 +633,37 @@ struct vm_operations_struct {
 	 * (using pte_page()) would not find the correct page.
 	 */
 	struct page *(*find_special_page)(struct vm_area_struct *vma,
-					  unsigned long addr);
+				  unsigned long addr);
+	/*
+	 * checks and locks a page in a vm area containing the address addr,
+	 * from page outs without risking causing page faults.
+	 */
+	bool (*lock_safe)(struct vm_area_struct * area, const unsigned long addr);
+	/*
+	 * unlocks a previously locked page in VM_PFNMAP |VM_IO area.
+	 */
+	bool (*unlock_safe)(struct vm_area_struct * area, const unsigned long addr);
+	/*
+	 * checks whether the page allows the given vma operations set in the
+	 * flag as VM_READ or VM_WRITE or both  at the given addess is
+	 * possible without causing any fault.
+	 */
+	bool (*operation_allowed)(struct vm_area_struct * area,
+				  unsigned long addr, int flag);
 };
+
+static inline bool vma_can_special_operations( struct vm_area_struct *area )
+{
+	const struct vm_operations_struct *ops;
+
+	if (!area)
+		return false;
+	if (!area->vm_ops)
+		return false;
+	ops = area->vm_ops;
+	return (!!ops->lock_safe && !!ops->unlock_safe &&
+		!!ops->operation_allowed);
+}
 
 static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
 {
@@ -654,6 +683,11 @@ static inline void vma_set_anonymous(struct vm_area_struct *vma)
 static inline bool vma_is_anonymous(struct vm_area_struct *vma)
 {
 	return !vma->vm_ops;
+}
+
+static inline bool vma_is_special(struct vm_area_struct *vma)
+{
+	return (vma->vm_ops && (vma->vm_flags & VM_SPECIAL));
 }
 
 static inline bool vma_is_temporary_stack(struct vm_area_struct *vma)
