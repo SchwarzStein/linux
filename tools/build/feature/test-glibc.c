@@ -2,7 +2,7 @@
 #include <stdlib.h>
 
 #if !defined(__UCLIBC__)
-#include <gnu/libc-version.h>
+//#include <gnu/libc-version.h>
 #else
 #define XSTR(s) STR(s)
 #define STR(s) #s
@@ -11,9 +11,9 @@
 int main(void)
 {
 #if !defined(__UCLIBC__)
-	const char *version = gnu_get_libc_version();
+	const char *version = "2.27";//gnu_get_libc_version();
 #else
-	const char *version = XSTR(__GLIBC__) "." XSTR(__GLIBC_MINOR__);
+	const char *version ="2.27"; //XSTR(__GLIBC__) "." XSTR(__GLIBC_MINOR__);
 #endif
 
 	return (long)version;

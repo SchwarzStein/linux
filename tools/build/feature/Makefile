@@ -83,6 +83,7 @@ all: $(FILES)
 
 __BUILD = $(CC) $(CFLAGS) -MD -Wall -Werror -o $@ $(patsubst %.bin,%.c,$(@F)) $(LDFLAGS)
   BUILD = $(__BUILD) > $(@:.bin=.make.output) 2>&1
+ _BUILD =  > $(@:.bin=.make.output) 2>&1
 
 __BUILDXX = $(CXX) $(CXXFLAGS) -MD -Wall -Werror -o $@ $(patsubst %.bin,%.cpp,$(@F)) $(LDFLAGS)
   BUILDXX = $(__BUILDXX) > $(@:.bin=.make.output) 2>&1
@@ -137,14 +138,14 @@ $(OUTPUT)test-libopencsd.bin:
 
 DWARFLIBS := -ldw
 ifeq ($(findstring -static,${LDFLAGS}),-static)
-DWARFLIBS += -lelf -lebl -lz -llzma -lbz2
+DWARFLIBS += -lelf -lz -llzma -lbz2
 endif
 
 $(OUTPUT)test-dwarf.bin:
-	$(BUILD) $(DWARFLIBS)
+	$(__BUILD) $(DWARFLIBS) $(_BUILD)
 
 $(OUTPUT)test-dwarf_getlocations.bin:
-	$(BUILD) $(DWARFLIBS)
+	$(__BUILD) -g $(DWARFLIBS) $(_BUILD)
 
 $(OUTPUT)test-libelf-getphdrnum.bin:
 	$(BUILD) -lelf
@@ -215,22 +216,24 @@ PERL_EMBED_CCOPTS = `perl -MExtUtils::Embed -e ccopts 2>/dev/null`
 FLAGS_PERL_EMBED=$(PERL_EMBED_CCOPTS) $(PERL_EMBED_LDOPTS)
 
 $(OUTPUT)test-libperl.bin:
-	$(BUILD) $(FLAGS_PERL_EMBED)
+	$(__BUILD) $(FLAGS_PERL_EMBED) $(_BUILD)
 
 $(OUTPUT)test-libpython.bin:
-	$(BUILD) $(FLAGS_PYTHON_EMBED)
+	$(__BUILD) $(FLAGS_PYTHON_EMBED) -L/usr/lib/python2.7/config/ $(_BUILD)
 
 $(OUTPUT)test-libpython-version.bin:
-	$(BUILD)
+	$(__BUILD) -L/usr/lib/python2.7/config/ $(_BUILD)
 
 $(OUTPUT)test-libbfd.bin:
-	$(BUILD) -DPACKAGE='"perf"' -lbfd -ldl
+	#$(__BUILD) -DPACKAGE='"perf"' -lbfd -ldl  $(_BUILD)
+	$(__BUILD) -DPACKAGE='"perf"' -lbfd -ldl -liberty -lz $(_BUILD)
 
 $(OUTPUT)test-libbfd-buildid.bin:
-	$(BUILD) -DPACKAGE='"perf"' -lbfd -ldl
+	#$(__BUILD) -DPACKAGE='"perf"' -lbfd -ldl   $(_BUILD)
+	$(__BUILD) -DPACKAGE='"perf"' -lbfd -ldl  -liberty -lz $(_BUILD)
 
 $(OUTPUT)test-disassembler-four-args.bin:
-	$(BUILD) -DPACKAGE='"perf"' -lbfd -lopcodes
+	$(__BUILD) -DPACKAGE='"perf"' -lbfd -lopcodes -ldl -liberty -lz $(_BUILD)
 
 $(OUTPUT)test-reallocarray.bin:
 	$(BUILD)
@@ -245,7 +248,7 @@ $(OUTPUT)test-cplus-demangle.bin:
 	$(BUILD) -liberty
 
 $(OUTPUT)test-backtrace.bin:
-	$(BUILD)
+	$(__BUILD) -lexecinfo $(_BUILD)
 
 $(OUTPUT)test-timerfd.bin:
 	$(BUILD)
