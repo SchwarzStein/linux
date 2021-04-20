@@ -205,22 +205,22 @@ bpf_probe_read_user_str_common(void *dst, u32 size,
 			       const void __user *unsafe_ptr)
 {
 	int ret;
-        /*
-         * First, we check whether the source address is in a special
-         * vma region. If so, we try and read from it. Incase of failure
-         * i.e. ret <=0, fall back to the direct read path.
-         */
-         ret = _read_user_vma(dst, unsafe_ptr, size);
-         if (ret > 0 ) {
-                 int i = 0;
-                 for (; i<(ret-1) && i < (size-1); i++) {
-                         if(((char*)dst)[i] =='\0')
-                                 break;
-                 }
-                 ((char*)dst)[i] = '\0';
-                 ret = i;
-                 return ret;
-         }
+	/*
+	 * First, we check whether the source address is in a special
+	 * vma region. If so, we try and read from it. Incase of failure
+	 * i.e. ret <=0, fall back to the direct read path.
+	*/
+	ret = _read_user_vma(dst, unsafe_ptr, size);
+	if (ret > 0) {
+		int i = 0;
+		for (; i<(ret-1) && i < (size-1); i++) {
+			if(((char*)dst)[i] =='\0')
+				break;
+		}
+		((char*)dst)[i] = '\0';
+		ret = i;
+		return ret;
+	}
 
 	/*
 	 * NB: We rely on strncpy_from_user() not copying junk past the NUL
@@ -367,14 +367,14 @@ static const struct bpf_func_proto bpf_probe_read_compat_str_proto = {
 #endif /* CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE */
 
 static int
-_write_user_vma(void __user *unsafe_ptr, void *src, u32 size)
+_write_user_vma(void __user *unsafe_ptr, const void *src, u32 size)
 {
 	struct vm_area_struct *area;
 	long unsigned addr;
 	int ret;
 
- 	addr = (unsigned long) unsafe_ptr;
-	area = find_vma(current->mm, src);
+	addr = (unsigned long) unsafe_ptr;
+	area = find_vma(current->mm, (unsigned long)src);
 
 	if (!area)
 		return 0;
@@ -386,7 +386,6 @@ _write_user_vma(void __user *unsafe_ptr, void *src, u32 size)
 	ret = area->vm_ops->access(area, addr, src, size, 1);
 	return ret;
 }
-
 
 BPF_CALL_3(bpf_probe_write_user, void __user *, unsafe_ptr, const void *, src,
 	   u32, size)
@@ -413,7 +412,7 @@ BPF_CALL_3(bpf_probe_write_user, void __user *, unsafe_ptr, const void *, src,
 	if (unlikely(!nmi_uaccess_okay()))
 		return -EPERM;
 	count = _write_user_vma(unsafe_ptr, src, size);
-	if(count > 0 )
+	if (count > 0)
 		return count;
 	return copy_to_user_nofault(unsafe_ptr, src, size);
 }

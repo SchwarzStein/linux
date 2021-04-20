@@ -374,11 +374,27 @@ out:
 	return ret < 0 ? ret : i;
 }
 
+bool lock_safe(struct vm_area_struct *area, unsigned long addr)
+{
+    return true;
+}
+bool unlock_safe(struct vm_area_struct *area, unsigned long addr)
+{
+    return true;
+}
+bool operation_allowed(struct vm_area_struct *Area, unsigned long addr, int flags)
+{
+    return true;
+}
+
 const struct vm_operations_struct sgx_vm_ops = {
 	.fault = sgx_vma_fault,
 	.mprotect = sgx_vma_mprotect,
 	.open = sgx_vma_open,
 	.access = sgx_vma_access,
+	.lock_safe = lock_safe,
+	.unlock_safe = unlock_safe,
+	.operation_allowed = operation_allowed
 };
 
 /**
