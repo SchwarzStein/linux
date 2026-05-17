@@ -156,12 +156,38 @@ static const struct bpf_func_proto bpf_override_return_proto = {
 	.arg2_type	= ARG_ANYTHING,
 };
 #endif
+static int
+_read_user_vma( void *dst, const void __user *unsafe_ptr, u32 size)
+{
+	long unsigned addr;
+	struct vm_area_struct *area;
+	const struct vm_operations_struct *vm_ops;
+	int ret;
+
+	addr = (const unsigned long) unsafe_ptr;
+	area = find_vma(current->mm, addr);
+
+	if (!area)
+		return 0;
+	if (!vma_is_special(area) && !vma_is_anonymous(area))
+		return 0;
+	if (!vma_can_special_operations(area))
+		return 0;
+
+	vm_ops = area->vm_ops;
+	pagefault_disable();
+	ret = vm_ops->access(area, addr, dst, size, 0);
+	pagefault_enable();
+	return ret;
+}
 
 static __always_inline int
 bpf_probe_read_user_common(void *dst, u32 size, const void __user *unsafe_ptr)
 {
 	int ret;
-
+	ret = _read_user_vma(dst, unsafe_ptr, size);
+	if (ret > 0)
+		return ret;
 	ret = copy_from_user_nofault(dst, unsafe_ptr, size);
 	if (unlikely(ret < 0))
 		memset(dst, 0, size);
@@ -188,6 +214,22 @@ bpf_probe_read_user_str_common(void *dst, u32 size,
 			       const void __user *unsafe_ptr)
 {
 	int ret;
+	/*
+	 * First, we check whether the source address is in a special
+	 * vma region. If so, we try and read from it. Incase of failure
+	 * i.e. ret <=0, fall back to the direct read path.
+	*/
+	ret = _read_user_vma(dst, unsafe_ptr, size);
+	if (ret > 0) {
+		int i = 0;
+		for (; i<(ret-1) && i < (size-1); i++) {
+			if(((char*)dst)[i] =='\0')
+				break;
+		}
+		((char*)dst)[i] = '\0';
+		ret = i;
+		return ret;
+	}
 
 	/*
 	 * NB: We rely on strncpy_from_user() not copying junk past the NUL
@@ -321,6 +363,28 @@ static const struct bpf_func_proto bpf_probe_read_compat_str_proto = {
 };
 #endif /* CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE */
 
+static int
+_write_user_vma(void __user *unsafe_ptr, const void *src, u32 size)
+{
+	struct vm_area_struct *area;
+	long unsigned addr;
+	int ret;
+
+	addr = (unsigned long) unsafe_ptr;
+	area = find_vma(current->mm, (unsigned long)addr);
+
+	if (!area)
+		return 0;
+	if (!vma_is_special(area) && !vma_is_anonymous(area))
+		return 0;
+	if (!vma_can_special_operations(area))
+		return 0;
+	pagefault_disable();
+	ret = area->vm_ops->access(area, addr, src, size, 1);
+	pagefault_enable();
+	return ret;
+}
+
 BPF_CALL_3(bpf_probe_write_user, void __user *, unsafe_ptr, const void *, src,
 	   u32, size)
 {
@@ -336,6 +400,7 @@ BPF_CALL_3(bpf_probe_write_user, void __user *, unsafe_ptr, const void *, src,
 	 * state, when the task or mm are switched. This is specifically
 	 * required to prevent the use of temporary mm.
 	 */
+	int count;
 
 	if (unlikely(in_interrupt() ||
 		     current->flags & (PF_KTHREAD | PF_EXITING)))
@@ -343,6 +408,9 @@ BPF_CALL_3(bpf_probe_write_user, void __user *, unsafe_ptr, const void *, src,
 	if (unlikely(!nmi_uaccess_okay()))
 		return -EPERM;
 
+	count = _write_user_vma(unsafe_ptr, src, size);
+	if (count > 0)
+		return count;
 	return copy_to_user_nofault(unsafe_ptr, src, size);
 }
 

@@ -3147,7 +3147,12 @@ static int perf_event_modify_breakpoint(struct perf_event *bp,
 
 	return err;
 }
-
+/*TODO: implement this */
+static int perf_event_modify_sw_breakpoint(struct perf_event *swbp,
+					 struct perf_event_attr *attr)
+{
+	return 0;
+}
 /*
  * Copy event-type-independent attributes that may be modified.
  */
@@ -3170,6 +3175,9 @@ static int perf_event_modify_attr(struct perf_event *event,
 	switch (event->attr.type) {
 	case PERF_TYPE_BREAKPOINT:
 		func = perf_event_modify_breakpoint;
+		break;
+	case PERF_TYPE_SW_BREAKPOINT:
+		func = perf_event_modify_sw_breakpoint;
 		break;
 	default:
 		/* Place holder for future additions. */
@@ -12148,6 +12156,7 @@ SYSCALL_DEFINE5(perf_event_open,
 
 	if (pid != -1 && !(flags & PERF_FLAG_PID_CGROUP)) {
 		task = find_lively_task_by_vpid(pid);
+		//trace_printk("pid found pid: %d task %p\n", pid, task);
 		if (IS_ERR(task)) {
 			err = PTR_ERR(task);
 			goto err_group_fd;
@@ -13411,7 +13420,7 @@ static struct notifier_block perf_reboot_notifier = {
 	.notifier_call = perf_reboot,
 	.priority = INT_MIN,
 };
-
+extern int init_sw_breakpoint(void);
 void __init perf_event_init(void)
 {
 	int ret;
@@ -13429,6 +13438,9 @@ void __init perf_event_init(void)
 
 	ret = init_hw_breakpoint();
 	WARN(ret, "hw_breakpoint initialization failed with: %d", ret);
+
+	ret = init_sw_breakpoint();
+	WARN(ret, "sw_breakpoint initialization failed with: %d", ret);
 
 	perf_event_cache = KMEM_CACHE(perf_event, SLAB_PANIC);
 

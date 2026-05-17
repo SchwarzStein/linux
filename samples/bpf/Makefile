@@ -122,6 +122,7 @@ xdp_router_ipv4-objs := xdp_router_ipv4_user.o $(XDP_SAMPLE)
 # Tell kbuild to always build the programs
 always-y := $(tprogs-y)
 always-y += sockex1_kern.o
+always-y += test_bpf.o
 always-y += sockex2_kern.o
 always-y += sockex3_kern.o
 always-y += tracex1_kern.o

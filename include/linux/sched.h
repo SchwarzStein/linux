@@ -1467,6 +1467,7 @@ struct task_struct {
 	struct bpf_local_storage __rcu	*bpf_storage;
 	/* Used for BPF run context */
 	struct bpf_run_ctx		*bpf_ctx;
+	atomic_t			swbp_count;
 #endif
 
 #ifdef CONFIG_GCC_PLUGIN_STACKLEAK
