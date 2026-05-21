@@ -148,31 +148,6 @@ static struct perf_event *search_event_by_current(struct pt_regs *regs)
 	return event;
 }
 
-//static struct sw_bp_info * has_event(struct thread_node *tnode, struct perf_event *event)
-//{
-//	struct list_head *position = NULL;
-//	struct sw_bp_info *sw_item  = NULL;
-//	unsigned long flags;
-//	bool irq = irqs_disabled();
-//
-//	if (!tnode) return NULL;
-//
-//	if (irq) spin_lock(&tnode->lock);
-//	else spin_lock_irqsave(&tnode->lock, flags);
-//
-//	list_for_each(position, &tnode->bp_list) {
-//		sw_item = list_entry(position, struct sw_bp_info, list);
-//		if (sw_item && sw_item->event == event) {
-//			if (irq) spin_unlock(&tnode->lock);
-//			else spin_unlock_irqrestore(&tnode->lock, flags);
-//			return sw_item;
-//		}
-//	}
-//	if (irq) spin_unlock(&tnode->lock);
-//	else spin_unlock_irqrestore(&tnode->lock, flags);
-//	return NULL;
-//}
-
 static struct sw_bp_info * search_by_event_destroy(struct perf_event *event,
 			 struct thread_node **rnode, struct process_list **rplist)
 {
@@ -198,44 +173,6 @@ static struct sw_bp_info * search_by_event_destroy(struct perf_event *event,
 	return info;
 }
 
-//static struct sw_bp_info * search_by_event(struct perf_event *event, struct thread_node **rnode, struct process_list **rplist)
-//{
-//	struct thread_node *tnode = NULL;
-//	struct process_list *plist = NULL;
-//	struct sw_bp_info *info   = NULL;
-//	unsigned long flags = 0;
-//	bool irq = irqs_disabled();
-//
-//	pid_t t_pid;
-//	pid_t t_tid;
-//	pid_t c_pid = task_tgid_nr(current);
-//
-//	t_pid = task_tgid_nr(event->hw.target);
-//	t_tid = task_pid_nr(event->hw.target);
-//
-//	if (irq) spin_lock(&process_lock);
-//	else spin_lock_irqsave(&process_lock, flags);
-//
-//	tnode = get_bp_list(t_pid, t_tid, &plist);
-//
-//	if (!tnode && c_pid != t_pid)
-//		tnode = get_bp_list(c_pid, c_pid, &plist);
-//
-//	if (irq) spin_unlock(&process_lock);
-//	else spin_unlock_irqrestore(&process_lock, flags);
-//
-//	if (!tnode) return NULL;
-//
-//	info = has_event(tnode, event);
-//
-//	if (info && rnode)
-//		*rnode= tnode;
-//
-//	if (info && rplist)
-//		*rplist = plist;
-//
-//	return info;
-//}
 
 static void swbp_perf_event_destroy(struct perf_event *event)
 {
