@@ -34,6 +34,9 @@
 #include <linux/cpu.h>
 #include <linux/smp.h>
 #include <linux/bug.h>
+#include <linux/refcount.h>
+#include <linux/rcupdate.h>
+#include <linux/uaccess.h>
 
 #include <asm/ptrace.h>
 #include <linux/perf_event.h>
@@ -93,9 +96,13 @@ struct lwfp
 	uint64_t 	config2;
 	pid_t 		o_pid;
 	pid_t 		t_pid;
+	pid_t 		t_tid;
 	enum lwfp_type type;
 	struct perf_lwfp_attr *attr;
 	struct list_head node;
+	struct rcu_head rcu;
+	bool removed;
+	refcount_t refs;
 };
 
 struct thread_node
@@ -104,16 +111,18 @@ struct thread_node
 	struct list_head lwfp_list; /*all the breakpoints of this thread*/
 	struct hlist_node node;/*entry into parent process' hashtable*/
 	spinlock_t lwfp_lock;
-	int refcount;
+	struct rcu_head rcu;
+	refcount_t refcount;
 };
 
 struct process_node
 {
 	pid_t pid;
 	struct hlist_node node; /*entry into global process list*/
-	DECLARE_HASHTABLE(thread_hashtable); /* 16 bucket hashtable for threads.*/
+	DECLARE_HASHTABLE(thread_hashtable, PROC_TABLE_WIDTH);
 	spinlock_t thread_lock;
-	int refcount;
+	struct rcu_head rcu;
+	refcount_t refcount;
 };
 
 struct lwfp_event
@@ -121,11 +130,13 @@ struct lwfp_event
 	struct perf_event *event; /*key*/
 	struct lwfp 	  *value; /*value*/
 	struct hlist_node  node;
+	struct rcu_head rcu;
+	refcount_t refs;
 };
 
 struct lwfp_context
 {
-	struct lwfp_attr *lwfp_attr;
+	struct perf_lwfp_attr *lwfp_attr;
 	struct perf_event *event;
 	struct pt_regs *regs;
 };
@@ -136,64 +147,151 @@ DEFINE_HASHTABLE(events_table, EVENT_HTABLE_WIDTH); /* allows quick searching of
 static spinlock_t lwfp_module_lock;
 static spinlock_t events_lock;
 
-+void *kvm_switch_handle_exception_nmi(void *new);
-+static int (*kvm_vmx_x86_handle_exception_nmi)(struct kvm_vcpu *vcpu) = NULL;
+#if defined(CONFIG_X86_64) && defined(CONFIG_KVM)
+void *kvm_switch_handle_exception_nmi(void *new);
+static int (*kvm_vmx_x86_handle_exception_nmi)(struct kvm_vcpu *vcpu);
+#endif
 
-int sw_breakpoint_exceptions_notify(struct notifier_block *unused,
-					unsigned long val, void *data)
+static void lwfp_rcu_free(struct rcu_head *rcu)
 {
-	struct die_args *args = data;
-	struct pt_regs *regs = args->regs;
-	struct perf_event *event = NULL;
-	int ret = NOTIFY_DONE;
-	long ip = 0;
-	pid_t pid = task_tgid_nr(current);
-	pid_t tid = task_pid_nr(current);
-	pid_t tpid;
-	pid_t ttid;
+	struct lwfp *lwfp;
 
-	if (val != DIE_INT3 ) return NOTIFY_DONE;
-
-	if (regs) ip = regs->ip;
-
-	/* only userspace traps */
-	if (regs && !user_mode(regs))
-		return NOTIFY_DONE;
-
-	event = search_event_by_current(regs);
-
-	if (!event) {
-		return ret;
-	}
-
-	tpid = task_tgid_nr(event->hw.target);
-	ttid = task_pid_nr(event->hw.target);
-	ret = execute_event(event, regs);
+	lwfp = container_of(rcu, struct lwfp, rcu);
+	kfree(lwfp->attr);
+	kfree(lwfp);
 }
 
-int execute_event(struct perf_event *event, struct pt_regs *regs)
+static void lwfp_put(struct lwfp *lwfp)
 {
-	int val;
-	switch(target->btype) {
-	case LWFP_TYPE_NORMAL:
-	case LWFP_TYPE_ENCLAVE:
-		val = perf_bp_event(event, regs);
-		return val;
-		break;
-	case LWFP_TYPE_EXTENDED:
-	case LWFP_TYPE_SGX:
-	case LWFP_TYPE_VM:
-		break;
-	default:
-		break;
+	if (lwfp && refcount_dec_and_test(&lwfp->refs))
+		call_rcu(&lwfp->rcu, lwfp_rcu_free);
+}
+
+static void thread_node_rcu_free(struct rcu_head *rcu)
+{
+	struct thread_node *thread;
+
+	thread = container_of(rcu, struct thread_node, rcu);
+	kfree(thread);
+}
+
+static void thread_node_put(struct thread_node *thread)
+{
+	if (thread && refcount_dec_and_test(&thread->refcount))
+		call_rcu(&thread->rcu, thread_node_rcu_free);
+}
+
+static void process_node_rcu_free(struct rcu_head *rcu)
+{
+	struct process_node *proc;
+
+	proc = container_of(rcu, struct process_node, rcu);
+	kfree(proc);
+}
+
+static void process_node_put(struct process_node *proc)
+{
+	if (proc && refcount_dec_and_test(&proc->refcount))
+		call_rcu(&proc->rcu, process_node_rcu_free);
+}
+
+static void lwfp_event_rcu_free(struct rcu_head *rcu)
+{
+	struct lwfp_event *event;
+
+	event = container_of(rcu, struct lwfp_event, rcu);
+	kfree(event);
+}
+
+static void lwfp_event_put(struct lwfp_event *event)
+{
+	if (event && refcount_dec_and_test(&event->refs))
+		call_rcu(&event->rcu, lwfp_event_rcu_free);
+}
+
+static inline int lwfp_match_regs_attr(const struct perf_lwfp_attr *attr,
+				       const struct pt_regs *regs)
+{
+	unsigned long match_bitmap;
+	unsigned int bit_index;
+	u64 reg_value;
+	int count = 0;
+
+	if (!attr || !regs)
+		return 0;
+
+	match_bitmap = (unsigned long)attr->match;
+	if (!match_bitmap)
+		return 0;
+
+	for_each_set_bit(bit_index, &match_bitmap, MAX_REGISTER_MATCH_COUNT) {
+#if defined(__x86_64__) || defined(__aarch64__)
+		reg_value = regs_get_register((struct pt_regs *)regs, arch_reg_offsets[bit_index]);
+#else
+		reg_value = 0;
+#endif
+		if (reg_value != attr->regs[bit_index])
+			return 0;
+		count++;
 	}
 
-	ret = NOTIFY_STOP;
+	return (count > 0);
+}
+
+int lwfp_exceptions_notify(struct notifier_block *unused,
+				      unsigned long val, void *data)
+{
+	struct die_args *args = data;
+	struct pt_regs *regs;
+	struct lwfp *lwfp;
+	int ret;
+
+	if (val != DIE_INT3)
+		return NOTIFY_DONE;
+
+	if (!args || !args->regs)
+		return NOTIFY_DONE;
+
+	regs = args->regs;
+
+	if (!user_mode(regs))
+		return NOTIFY_DONE;
+
+	lwfp = search_for_event(task_tgid_nr(current),
+				task_pid_nr(current), regs);
+	if (!lwfp)
+		return NOTIFY_DONE;
+
+	ret = execute_event(lwfp, regs);
+	lwfp_put(lwfp);
+
 	return ret;
 }
 
-static struct notifier_block sw_breakpoint_exceptions_nb = {
-	.notifier_call = sw_breakpoint_exceptions_notify,
+static
+int execute_event(struct lwfp *target, struct pt_regs *regs)
+{
+	if (!target || !target->event || !regs)
+		return NOTIFY_DONE;
+
+	switch (target->type) {
+	case LWFP_TYPE_NORMAL:
+	case LWFP_TYPE_ENCLAVE:
+		return perf_bp_event(target->event, regs);
+
+	case LWFP_TYPE_EXTENDED:
+	case LWFP_TYPE_SGX:
+	case LWFP_TYPE_VM:
+		/* Type-specific post-processing goes here. */
+		return NOTIFY_STOP;
+
+	default:
+		return NOTIFY_DONE;
+	}
+}
+
+static struct notifier_block lwfp_exceptions_nb = {
+	.notifier_call = lwfp_exceptions_notify,
 	/* we need to be notified first */
 	.priority = 0x7fffffff
 };
@@ -211,57 +309,58 @@ static inline void kick_not_current_thread(struct perf_event *event)
 static int
 remove_and_free_lwfp(struct thread_node *thread, struct lwfp *bp)
 {
-	if (!bp || !thread) return 0;
+	bool removed = false;
+
+	if (!bp || !thread)
+		return 0;
 
 	spin_lock(&thread->lwfp_lock);
-	list_del(&bp->node);
+	if (!bp->removed) {
+		bp->removed = true;
+		list_del_rcu(&bp->node);
+		removed = true;
+	}
 	spin_unlock(&thread->lwfp_lock);
 
-	if (bp->btype == LWFP_TYPE_EXTENDED || bp->type == LWFP_TYPE_VM
-			|| bp->type == LWFP_TYPE_SGX) {
-		if (bp->attr) kfree(bp->attr);
+	if (removed)
+		lwfp_put(bp);
+
+	return removed;
+}
+
+
+static int remove_thread(struct process_node *proc,
+			 struct thread_node *thread)
+{
+	bool removed = false;
+
+	if (!proc || !thread)
+		return 0;
+
+	spin_lock(&proc->thread_lock);
+	if (!hlist_unhashed(&thread->node)) {
+		hash_del_rcu(&thread->node);
+		removed = true;
 	}
-
-	kfree(bp);
-	return 1;
-}
-
-static int
-remove_and_free_thread(struct process_node *proc, struct thread_node *tnode)
-{
-	if (!proc || !tnode) return 0;
-
-	spin_lock(&proc->thread_lock);
-	list_del(&tnode->node);
-	spin_unlock(&proc->thread_lock);
-	kfree(tnode);
-	return 1;
-}
-
-static int
-remove_thread(struct process_node *proc, struct thread_node *thread)
-{
-	struct thread_node *tnode;
-
-	if (!proc || !tnode) return 0;
-
-	spin_lock(&proc->thread_lock);
-	hash_del(proc->thread_hashtable, thread->tid);
 	spin_unlock(&proc->thread_lock);
 
+	if (removed)
+		thread_node_put(thread);
+
+	return removed;
 }
 
 static struct thread_node *
 get_thread_node(struct process_node *proc, pid_t tid)
 {
 	struct thread_node *thread;
-	struct thread_node *tmp;
 
 	if (!proc) return NULL;
 
 	rcu_read_lock();
-	hash_for_each_possible(proc->thread_hashtable, tmp, thread, tid) {
-		if (thread->tid == tid) {
+	hash_for_each_possible_rcu(proc->thread_hashtable, thread, node, tid) {
+		if (thread->tid == tid &&
+		    refcount_inc_not_zero(&thread->refcount)) {
 			rcu_read_unlock();
 			return thread;
 		}
@@ -274,11 +373,11 @@ static struct process_node *
 get_process_node(pid_t pid)
 {
 	struct process_node *proc;
-	struct process_node *temp;
 
 	rcu_read_lock();
-	hash_for_each_possible(lwfp_module, temp, proc, node) {
-		if (proc->pid == pid) {
+	hash_for_each_possible_rcu(lwfp_module, proc, node, pid) {
+		if (proc->pid == pid &&
+		    refcount_inc_not_zero(&proc->refcount)) {
 			rcu_read_unlock();
 			return proc;
 			break;
@@ -292,17 +391,37 @@ static int
 remove_process(pid_t pid)
 {
 	struct process_node *proc;
-	int bucket;
+	bool empty;
+	bool removed = false;
 
-	rcu_read_lock();
-	hash_for_each_possible(lwfp_module, bucket, proc, node) {
-		if (proc->pid == pid)
-			break;
+	proc = get_process_node(pid);
+	if (!proc)
+		return 0;
+
+	spin_lock(&proc->thread_lock);
+	empty = hash_empty(proc->thread_hashtable);
+	spin_unlock(&proc->thread_lock);
+
+	if (!empty) {
+		process_node_put(proc);
+		return 0;
 	}
-	rcu_read_unlock();
-	if (proc && proc->pid != pid) return 0;
 
-	struct thread_node *thread;
+	spin_lock(&lwfp_module_lock);
+	if (!hlist_unhashed(&proc->node)) {
+		hash_del_rcu(&proc->node);
+		removed = true;
+	}
+	spin_unlock(&lwfp_module_lock);
+
+	/* Lookup reference. */
+	process_node_put(proc);
+
+	/* Hash-table ownership reference. */
+	if (removed)
+		process_node_put(proc);
+
+	return removed;
 }
 
 static struct thread_node *
@@ -310,13 +429,18 @@ add_new_thread(struct process_node *node, pid_t tid)
 {
 	struct thread_node *new_thread = NULL;
 
-	new_thread = kzalloc(sizeof(struct thread_node), GPF_KERNEL);
+	new_thread = kzalloc(sizeof(struct thread_node), GFP_KERNEL);
 	if (!new_thread) return NULL;
+
 	new_thread->tid = tid;
 	INIT_LIST_HEAD(&new_thread->lwfp_list);
-	spin_lock(node->thread_lock);
-	hash_add_rcu(node->thread_hashtable, new_thread, tid);
-	spin_unlock(node->thread_lock);
+
+	spin_lock_init(&new_thread->lwfp_lock);
+	refcount_set(&new_thread->refcount, 1);
+	spin_lock(&node->thread_lock);
+
+	hash_add_rcu(node->thread_hashtable, &new_thread->node, tid);
+	spin_unlock(&node->thread_lock);
 
 	return new_thread;
 }
@@ -329,34 +453,40 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 	/*TODO: check if this is in IRQ */
 
 	lwfp = kzalloc(sizeof(struct lwfp), GFP_KERNEL);
-	if (lwfp == NULL) goto NULL;
+	if (lwfp == NULL)
+		return NULL;
 
 	lwfp->config1 = event->attr.config1;
 	lwfp->config2 = event->attr.config2;
-	lwfp->btype   = event->attr.bp_type;
+	lwfp->type    = event->attr.bp_type;
 	lwfp->o_pid   = task_tgid_nr(current);
 	lwfp->t_pid   = task_tgid_nr(event->hw.target);
-	lwfp->enabled = 0;
+	lwfp->t_tid   = task_pid_nr(event->hw.target);
+	lwfp->removed = false;
+	refcount_set(&lwfp->refs, 1);
 
-	if (lwfp->btype == LWFP_TYPE_VM || lwfp->bytpe == LWFP_TYPE_SGX ||
-			lwfp->bytpe == LWFP_TYPE_EXTENDED) {
-		if (lwfp->config2 == NULL) goto error_alloc;
+	if (lwfp->type == LWFP_TYPE_VM || lwfp->type == LWFP_TYPE_SGX ||
+			lwfp->type == LWFP_TYPE_EXTENDED) {
+		if (lwfp->config2 == 0) goto error_alloc;
 
 		lwfp->attr = kzalloc(sizeof(struct perf_lwfp_attr), GFP_KERNEL);
-		if (lwpf->attr == NULL) goto error_alloc;
+		if (lwfp->attr == NULL) goto error_alloc;
 	}
 
-	count = copy_from_user(lwfp->attr, (void*) event->attr.config2,
-			sizeof(struct perf_lwfp_attr));
-
-	if (count != 0) {
-		kfree(lwfp->attr);
-		goto error_alloc;
+	if (lwfp->attr) {
+		count = copy_from_user(lwfp->attr,
+				       u64_to_user_ptr(event->attr.config2),
+				       sizeof(struct perf_lwfp_attr));
+		if (count != 0) {
+			kfree(lwfp->attr);
+			lwfp->attr = NULL;
+			goto error_alloc;
+		}
 	}
 
-	spin_lock(&thread->lock);
-	list_add_rcu(&target->lwfp_list, &lwfp->bp_node);
-	spin_unlock(&thread->lock);
+	spin_lock(&target->lwfp_lock);
+	list_add_rcu(&lwfp->node, &target->lwfp_list);
+	spin_unlock(&target->lwfp_lock);
 
 	return lwfp;
 error_alloc:
@@ -364,7 +494,7 @@ error_alloc:
 		return NULL;
 }
 
-static process_node *
+static struct process_node *
 add_new_process(pid_t pid)
 {
 	struct process_node *new_node;
@@ -372,11 +502,14 @@ add_new_process(pid_t pid)
 	new_node = kzalloc(sizeof(struct process_node), GFP_KERNEL);
 	if (!new_node) return NULL;
 
-	node->pid = pid;
-	spin_lock_init(&node->thread_lock);
-	hash_init(node->events_table);
+	new_node->pid = pid;
+
+	spin_lock_init(&new_node->thread_lock);
+	hash_init(new_node->thread_hashtable);
+	refcount_set(&new_node->refcount, 1);
 	spin_lock(&lwfp_module_lock);
-	hash_add_rcu(lwfp_module, new_node, pid);
+
+	hash_add_rcu(lwfp_module, &new_node->node, pid);
 	spin_unlock(&lwfp_module_lock);
 
 	return new_node;
@@ -385,59 +518,50 @@ add_new_process(pid_t pid)
 static struct lwfp_event *
 create_lwfp_event(struct perf_event *event, struct lwfp *lwfp)
 {
-	struct swb_event *new_node;
+	struct lwfp_event *new_node;
 
 	new_node = kzalloc(sizeof(struct lwfp_event), GFP_KERNEL);
 	if (!new_node) return NULL;
 
 	new_node->event = event;
 	new_node->value = lwfp;
+	refcount_set(&new_node->refs, 1);
 	return new_node;
 }
 
 static struct lwfp_event *
 search_for_lwfp(struct perf_event *event)
 {
-	struct swpb_event *target_event = NULL;
-	struct lwfp_event *cursor = NULL;
+	struct lwfp_event *target_event = NULL;
 
 	rcu_read_lock();
-	hash_for_each_possible_rcu(events_table, target_event, node, event) {
-		if (event == target_event->event) {
+	hash_for_each_possible_rcu(events_table, target_event, node, (unsigned long)event) {
+		if (event == target_event->event &&
+		    refcount_inc_not_zero(&target_event->refs)) {
 			rcu_read_unlock();
 			return target_event;
 		}
 	}
 	rcu_read_unlock();
-
 	return NULL;
 }
 
 inline int match_lwfp_extended(struct lwfp *lwfp, struct pt_regs *regs)
 {
-	unsigned long match_bitmap;
-	unsigned int bit_index;
-	uint64_t reg_value;
-	int count = 0;
-
-	if (!lwfp) return 0;
-	if (!lwfp->attr) return 0;
-
-	match_bitmap = (unsigned long)lwfp->attr->match;
-
-	for_each_set_bit(bit_index, &match_bitmap, MAX_REGISTER_MATCH_COUNT) {
-#if defined (__x86_64__)
-		reg_value = regs_get_register(regs, arch_reg_offsets[bit_index]);
-#elif defined(__aarch64__)
-		reg_value = attr->regs[bit_index];
-#endif
-		if (reg_value != lwfp->attr->regs[bit_index])
-			return 0;
-		count++;
-	}
-	return (count > 0);
+	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL, regs);
 }
 
+inline int match_lwfp_vm(struct lwfp *lwfp, struct pt_regs *regs)
+{
+	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL, regs);
+}
+
+inline int match_lwfp_sgx(struct lwfp *lwfp, struct pt_regs *regs)
+{
+	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL, regs);
+}
+
+#if defined(CONFIG_X86_64) && defined(CONFIG_KVM)
 
 void get_regs_from_vcpu(struct kvm_vcpu *vcpu, struct pt_regs *regs)
 {
@@ -468,7 +592,6 @@ void get_regs_from_vcpu(struct kvm_vcpu *vcpu, struct pt_regs *regs)
     regs->ss = static_call(kvm_x86_get_segment)(vcpu, VCPU_SREG_SS).selector;
 }
 
-
 int lwfp_handle_kvm_x86_exception_nmi(struct kvm_vcpu *vcpu)
 {
 	struct pt_regs regs;
@@ -478,83 +601,62 @@ int lwfp_handle_kvm_x86_exception_nmi(struct kvm_vcpu *vcpu)
 	struct lwfp *lwfp;
 	int found = 0;
 	int ret;
+	pid_t pid;
+	pid_t tid;
 
-	ret =  kvm_vmx_x86_handle_exception_nmi(vcpu);
+	if (kvm_vmx_x86_handle_exception_nmi)
+		ret = kvm_vmx_x86_handle_exception_nmi(vcpu);
+	else
+		ret = NOTIFY_DONE;
 
 	/*if the vcpu has no debug enabled, skip*/
 	if (!(vcpu->guest_debug & KVM_GUESTDBG_USE_BP))
 		return ret;
 
-	if (!(vcpu->run->exit_reason == KVM_EXIT_DEBUG &&
+	if (vcpu->run->exit_reason != KVM_EXIT_DEBUG )
 		return ret;
-	}
 
 	get_regs_from_vcpu(vcpu, &regs);
 
+	pid = task_tgid_nr(current);
+	tid = task_pid_nr(current);
+
 	proc_item = get_process_node(pid);
 	if (!proc_item) return ret;
-	thread_item = get_thread_node(proc_item, tid);
-	if (!thread_item) return ret;
 
-	/**/
-	list_for_each_entry(lwfp, thread_item, lwfp_list) {
-		if (lwfp->type != LWFP_TYPE_VM) continue;
-		if (match_lwfp_vm(lwfp, regs)){
+	thread_item = get_thread_node(proc_item, tid);
+
+	if (!thread_item) {
+		process_node_put(proc_item);
+		return ret;
+	}
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(lwfp, &thread_item->lwfp_list, node) {
+		if (lwfp->type != LWFP_TYPE_VM)
+			continue;
+		if (instruction_pointer(&regs) != lwfp->config1)
+			continue;
+		if (match_lwfp_vm(lwfp, &regs) &&
+		    refcount_inc_not_zero(&lwfp->refs)) {
 			found = 1;
 			break;
 		}
 	}
+	rcu_read_unlock();
 
-	if (!found) ;//call other handlers
+	thread_node_put(thread_item);
+	process_node_put(proc_item);
 
-	found = perf_bp_event(event, regs);
-
-	if (found == 0) {
-		if (lwfp->flags & LWFP_RIP_INC) {
-			kvm_rip_write(vcpu, regs->ip + 1);
-		}
-	}
-	return 0;
+	if (!found)
+		return ret;
+	/*ensure uniqueness during setup*/
+	ret = perf_bp_event(lwfp->event, &regs);
+	lwfp_put(lwfp);
+	return ret;
 }
 
-inline int match_lwfp_vm(struct lwfp *lwfp, struct pt_regs *regs)
-{
-	unsigned long match_bitmap;
-	unsigned int bit_index;
-	uint64_t reg_value;
-	int count = 0;
-
-	if (!lwfp) return 0;
-	if (!lwfp->attr) return 0;
-
-	match_bitmap = (unsigned long)lwfp->attr->match;
-
-	for_each_set_bit(bit_index, &match_bitmap, MAX_REGISTER_MATCH_COUNT) {
-#if defined (__x86_64__)
-		reg_value = regs_get_register(regs, arch_reg_offsets[bit_index]);
-#elif defined(__aarch64__)
-		reg_value = attr->regs[bit_index];
 #endif
-		if (reg_value != lwfp->attr->regs[bit_index])
-			return 0;
-		count++;
-	}
-	return (count > 0);
-}
-
-inline int match_lwfp_sgx(struct lwfp *lwfp, struct pt_regs *regs)
-{
-	int ret_val;
-	struct lwfp_context ctx = {
-		.lwfp_attr = lwfp->attr,
-		.event = lwfp->event,
-		.regs = regs,
-	};
-	ret_val = blocking_notifier_call_chain(&lwfp_sgx_notifier_list, lwfp->type, regs);
-	if (ret_val == NOTIFY_DONE)
-		return 1;
-	return 0;
-}
 
 inline struct lwfp *
 search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
@@ -565,12 +667,17 @@ search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
 	int found = 0;
 
 	proc_item = get_process_node(pid);
-	if (!proc_item) return NULL;
-	thread_item = get_thread_node(proc_item, tid);
-	if (!thread_item) return NULL;
+	if (!proc_item)
+		return NULL;
 
-	spin_lock(&thread_item->lwfp_lock);
-	list_for_each_entry(lwfp, thread_item, lwfp_list) {
+	thread_item = get_thread_node(proc_item, tid);
+	if (!thread_item) {
+		process_node_put(proc_item);
+		return NULL;
+	}
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(lwfp, &thread_item->lwfp_list, node) {
 		if (instruction_pointer(regs) != lwfp->config1)
 			continue;
 
@@ -579,10 +686,10 @@ search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
 			found = 1;
 			break;
 		case LWFP_TYPE_ENCLAVE:
-		#if defined(__x86_64_)
+#if defined(__x86_64__)
 			if (lwfp->config2 == regs->bx)
 				found = 1;
-		#endif
+#endif
 			break;
 		case LWFP_TYPE_EXTENDED:
 			found = match_lwfp_extended(lwfp, regs);
@@ -598,221 +705,365 @@ search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
 		}
 		if (found) break;
 	}
-	spin_unlock(&thread_item->lwfp_lock);
-	if (!found) lwfp = NULL;
 
+	if (found && !refcount_inc_not_zero(&lwfp->refs))
+		found = 0;
+
+	rcu_read_unlock();
+	thread_node_put(thread_item);
+	process_node_put(proc_item);
+
+	if (!found)
+		return NULL;
 	return lwfp;
 }
 
 inline struct perf_event *
 event_from_context(struct pt_regs *regs)
 {
-	struct lwfp_event *target_event = NULL;
-	struct lwfp_event *temp_event = NULL;
-	struct lwfp *lwfp = NULL;
-	struct thread_node *target_thread = NULL;
+ 	struct lwfp *lwfp = NULL;
+	struct lwfp_event *target_event;
 
-	pid_t pid;
+ 	pid_t pid;
 	pid_t tid;
 
 	pid = task_tgid_nr(current);
 	tid = task_pid_nr(current);
 
+	lwfp = search_for_event(pid, tid, regs);
+	if (!lwfp)
+		return NULL;
 
-	target_event = search_for_lwfp(regs);
-	if (target_event == 0) return 0;
+	target_event = search_for_lwfp(lwfp->event);
+	lwfp_put(lwfp);
+	if (!target_event)
+		return NULL;
 
-
-
-
-
+	{
+		struct perf_event *event = target_event->event;
+		lwfp_event_put(target_event);
+		return event;
+	}
 }
 
-/* allocate resources for this sw bp. Add it to the list*/
-static int sw_breakpoint_event_init(struct perf_event *event)
+static int lwfp_event_init(struct perf_event *event)
 {
-	/* get current pid
-	 * get target pid/tid
-	 * check if target is in table
-	 * allocate if missing or
-	 * (a) append if missing or append to bp_list for tid
-	 * put to a global hashtable of events
-	 * return success
-	*/
-
 	struct process_node *proc_item = NULL;
+	struct thread_node *thread = NULL;
 	struct lwfp_event *target_event = NULL;
+	struct lwfp_event *existing_event;
 	struct lwfp *lwfp = NULL;
-	struct thread_node *target_thread = NULL;
-
-	int thread_created = 0;
+	bool process_created = false;
+	bool thread_created = false;
 	pid_t pid;
 	pid_t tid;
+	int ret = -ENOMEM;
 
-	//check if valid event
-	if ( (event->attr.btype == LWFP_TYPE_VM ||
-			event->attr.btype == LWFP_TYPE_SGX ||
-			event->attr.btype == LWFP_TYPE_EXTENDED) &&
-			event->atttr.config2 == 0)
-				return -EINVAL;
+	if ((event->attr.bp_type == LWFP_TYPE_VM ||
+	     event->attr.bp_type == LWFP_TYPE_SGX ||
+	     event->attr.bp_type == LWFP_TYPE_EXTENDED) &&
+	    event->attr.config2 == 0)
+		return -EINVAL;
 
 	pid = task_tgid_nr(current);
-	tid = task_pid_nr(current);
+	tid = task_pid_nr(event->hw.target);
 
-	rcu_read_lock();
-	hash_for_each_possible_rcu(events_table, target_event, node, event) {
-		if (event == target_event->event) {
-			rcu_read_unlock();
-			return -EEXIST;
-		}
-	}
-	rcu_read_unlock();
+	/*
+	 * Find or create the process atomically.
+	 *
+	 * One reference belongs to lwfp_module. A second reference belongs
+	 * to this event-init operation.
+	 */
+	spin_lock(&lwfp_module_lock);
 
-	/*it does not exist*/
-	/*check if process does not exist*/
-
-	rcu_read_lock();
-	hash_for_each_possible_rcu(lwfp_module, proc_item, node, pid) {
+	hash_for_each_possible(lwfp_module, proc_item, node, pid) {
 		if (proc_item->pid == pid) {
+			refcount_inc(&proc_item->refcount);
 			break;
 		}
 	}
-	rcu_read_unlock();
 
-	if (proc_item == NULL || proc_item->pid != pid) {
-		//add a new process node
-		proc_item = add_new_process(pid);
-		if (proc_item == NULL) return -ENOMEM;//TODO goto
-		new_thread = NULL;
-	} else {
-		//search for thread
-		rcu_read_lock();
-		hash_for_each_possible_rcu(proc_item->thread_hashtable, target_thread, node, tid) {
-			if (new_thread->tid == tid) {
-				break;
-			}
+	if (!proc_item) {
+		proc_item = kzalloc(sizeof(*proc_item), GFP_ATOMIC);
+		if (proc_item) {
+			proc_item->pid = pid;
+			spin_lock_init(&proc_item->thread_lock);
+			hash_init(proc_item->thread_hashtable);
+			refcount_set(&proc_item->refcount, 2);
+
+			hash_add_rcu(lwfp_module, &proc_item->node, pid);
+			process_created = true;
 		}
-		rcu_read_unlock();
 	}
 
-	if (new_thread == NULL || thread->tid != tid) {
-		new_thread = add_new_thread(process_item, tid);
-		if (new_thread == NULL) goto thread_fail;
-		thread_created = 1;
-	}
-
-	//create a new lwfp_node and append to new_thread
-	lwfp = add_new_lwfp(event, new_thread);
-	if (!lwfp) goto error_lwfp; /*if new proc and new_thread, delete them*/
-
-	target_event = create_lwfp_event(event, lwfp);
-	if (!target_event) goto error_lwfp;
-
-	//add item to events hash
-	spin_lock(&events_lock);
-	hash_add_rcu(&events_table, &lwfp_event->node, event);
-	spin_unlock(&events_lock);
-
-
-	/*register kvm handler*/
-	kvm_vmx_x86_handle_exception_nmi = kvm_switch_handle_exception_nmi(lwfp-handle_kvm_notify);
-
-	return 0;
-
-thread_fail:
-	return -ENOMEM;
-
-error_lwfp:
-	if (thread_created) remove_and_free_thread(proc_item, new_thread);
-	if (lwfp) kfree(lwfp);
-	return -ENOMEM;
-}
-
-static int sw_breakpoint_event_destroy(struct perf_event *event)
-{
-	struct process_node *proc_item;
-	struct thread_node  *thread;
-	struct lwfp_event   *bp_event;
-	struct lwfp         *lwfp;
-	pid_t pid,tid;
-
-	bp_event = search_for_lwfp(event);
-	if (!bp_event) return 0;
-
-	lwfp = bp_event->value;
-	spin_lock(&events_lock);//TODO reference count
-	hash_del_rcu(&bp_event->node);
-	spin_unlock(&events_lock);
-
-	proc_item = get_process_node(pid); //TODO: check proc_item
-
-	if (!proc_item) return 0;//TODO: warning
-
-	thread  = get_thread_node(proc_item, tid);
-	if (!thread) return 0;
-
-	remove_and_free_lwfp(thread, lwfp);
-	kfree(bp_event);
-
-	if (thread->refcount != 0) return 0;
-
-	remove_and_free_thread(proc_item, thread);
-
-	spin_lock(&lwfp_module_lock);
-	if (proc_item->refcount == 0) {
-		hash_del(lwfp_module, pid);
-		kfree(proc_item);
-	}
 	spin_unlock(&lwfp_module_lock);
 
+	if (!proc_item)
+		return -ENOMEM;
+
+	/*
+	 * Find or create the thread atomically.
+	 *
+	 * One reference belongs to proc_item->thread_hashtable. A second
+	 * reference belongs to this event-init operation.
+	 */
+	spin_lock(&proc_item->thread_lock);
+
+	hash_for_each_possible(proc_item->thread_hashtable, thread, node, tid) {
+		if (thread->tid == tid) {
+			refcount_inc(&thread->refcount);
+			break;
+		}
+	}
+
+	if (!thread) {
+		thread = kzalloc(sizeof(*thread), GFP_ATOMIC);
+		if (thread) {
+			thread->tid = tid;
+			INIT_LIST_HEAD(&thread->lwfp_list);
+			spin_lock_init(&thread->lwfp_lock);
+			refcount_set(&thread->refcount, 2);
+
+			hash_add_rcu(proc_item->thread_hashtable,
+				     &thread->node, tid);
+			thread_created = true;
+		}
+	}
+
+	spin_unlock(&proc_item->thread_lock);
+
+	if (!thread)
+		goto process_cleanup;
+
+	lwfp = add_new_lwfp(event, thread);
+	if (!lwfp)
+		goto thread_cleanup;
+
+	target_event = create_lwfp_event(event, lwfp);
+	if (!target_event)
+		goto lwfp_cleanup;
+
+	/*
+	 * Duplicate checking and insertion must be performed under the
+	 * same lock.
+	 */
+	spin_lock(&events_lock);
+
+	hash_for_each_possible(events_table, existing_event, node,
+			       (unsigned long)event) {
+		if (existing_event->event == event) {
+			spin_unlock(&events_lock);
+			ret = -EEXIST;
+			goto event_cleanup;
+		}
+	}
+
+	/*
+	 * target_event->refs == 1 is the events_table ownership.
+	 *
+	 * lwfp->refs == 1 is the thread list ownership. The event table
+	 * takes an additional LWFP reference.
+	 */
+	hash_add_rcu(events_table, &target_event->node,
+		     (unsigned long)event);
+	refcount_inc(&lwfp->refs);
+
+	spin_unlock(&events_lock);
+
+	/* Release the local operation references. */
+	thread_node_put(thread);
+	process_node_put(proc_item);
+
+	return 0;
+
+event_cleanup:
+	lwfp_event_put(target_event);
+
+lwfp_cleanup:
+	remove_and_free_lwfp(thread, lwfp);
+
+thread_cleanup:
+	if (thread_created)
+		remove_thread(proc_item, thread);
+
+	/* Release the local thread reference. */
+	thread_node_put(thread);
+
+process_cleanup:
+	/* Release the local process reference. */
+	process_node_put(proc_item);
+
+	/*
+	 * If this function created the process, no other thread can own it
+	 * after the thread cleanup above, so remove its hash-table entry.
+	 */
+	if (process_created)
+		remove_process(pid);
+
+	return ret;
+}
+
+static bool unlink_empty_process(struct process_node *proc)
+{
+	bool removed = false;
+
+	if (!proc)
+		return false;
+
+	spin_lock(&proc->thread_lock);
+	if (hash_empty(proc->thread_hashtable)) {
+		spin_lock(&lwfp_module_lock);
+		if (!hlist_unhashed(&proc->node)) {
+			hash_del_rcu(&proc->node);
+			removed = true;
+		}
+		spin_unlock(&lwfp_module_lock);
+	}
+	spin_unlock(&proc->thread_lock);
+
+	return removed;
+}
+
+static int lwfp_event_destroy(struct perf_event *event)
+{
+	struct process_node *proc_item = NULL;
+	struct thread_node *thread = NULL;
+	struct lwfp_event *bp_event;
+	struct lwfp *lwfp;
+	pid_t pid;
+	pid_t tid;
+
+	bp_event = search_for_lwfp(event);
+	if (!bp_event)
+		return 0;
+
+	lwfp = bp_event->value;
+	if (!lwfp || !refcount_inc_not_zero(&lwfp->refs)) {
+		/*
+		 * Drop the lookup reference acquired by
+		 * search_for_lwfp().
+		 */
+		lwfp_event_put(bp_event);
+		return 0;
+	}
+
+	pid = lwfp->t_pid;
+	tid = lwfp->t_tid;
+
+	/*
+	 * Remove the event-table entry. The initial bp_event reference
+	 * belongs to the event table; the lookup reference remains held
+	 * until the end of this function.
+	 */
+	spin_lock(&events_lock);
+	if (!hlist_unhashed(&bp_event->node))
+		hash_del_rcu(&bp_event->node);
+	spin_unlock(&events_lock);
+
+	/* Drop the event-table reference to lwfp. */
+	lwfp_put(lwfp);
+
+	proc_item = get_process_node(pid);
+	if (proc_item) {
+		thread = get_thread_node(proc_item, tid);
+		if (thread) {
+			/* Drops the list-owned LWFP reference. */
+			remove_and_free_lwfp(thread, lwfp);
+
+			/* Remove an empty thread from the process table. */
+			spin_lock(&thread->lwfp_lock);
+			if (list_empty(&thread->lwfp_list))
+				remove_thread(proc_item, thread);
+			spin_unlock(&thread->lwfp_lock);
+
+			/* Drop the lookup reference from get_thread_node(). */
+			thread_node_put(thread);
+		}
+
+		/*
+		 * Remove and RCU-free an empty process. Do not inspect
+		 * refcount_t directly and do not call kfree() here.
+		 */
+		if (unlink_empty_process(proc_item))
+			/* Drop the process-table reference. */
+			process_node_put(proc_item);
+
+		/* Drop the lookup reference from get_process_node(). */
+		process_node_put(proc_item);
+	}
+
+	/* Drop the local LWFP reference acquired above. */
+	lwfp_put(lwfp);
+
+	/*
+	 * Drop the lookup reference acquired by search_for_lwfp().
+	 * The event-table reference was removed above.
+	 */
+	lwfp_event_put(bp_event);
+
 	return 0;
 }
 
-static int sw_breakpoint_add(struct perf_event *event, int flags)
+static int lwfp_add(struct perf_event *event, int flags)
 {
 	/*HB API requires hardware programming in this step*/
+	return 0;
 }
 
-static void sw_breakpoint_del(struct perf_event *event, int flags)
+static void lwfp_del(struct perf_event *event, int flags)
 {
 	/*HB API requires hardware clearing in this step*/
+	return 0;
 }
 
-static void sw_breakpoint_start(struct perf_event *event, int flags)
+static void lwfp_start(struct perf_event *event, int flags)
 {
 	/*HB API requires enabling hardware in this step*/
+	event->hw.state = 0;
 }
 
-static void sw_breakpoint_stop(struct perf_event *event, int flags)
+static void lwfp_stop(struct perf_event *event, int flags)
 {
 	/*HB API requires disabling hardware in this step*/
 	event->hw.state = PERF_HES_STOPPED;
 }
 
-void sw_breakpoint_pmu_read(struct perf_event *event)
+void lwfp_pmu_read(struct perf_event *event)
 {
 	//read the given pmu into the event
 }
 
-static struct pmu perf_sw_breakpoint = {
+static struct pmu perf_lwfp = {
 	.task_ctx_nr	= perf_sw_context,
-	.event_init	= sw_breakpoint_event_init,
-	.add		= sw_breakpoint_add,
-	.del		= sw_breakpoint_del,
-	.start		= sw_breakpoint_start,
-	.stop		= sw_breakpoint_stop,
-	.read		= sw_breakpoint_pmu_read,
+	.event_init	    = lwfp_event_init,
+	.add		    = lwfp_add,
+	.del		    = lwfp_del,
+	.start		    = lwfp_start,
+	.stop		    = lwfp_stop,
+	.read		    = lwfp_pmu_read,
+	.event_destroy  = lwfp_event_destroy,
 };
 
-int __init init_sw_breakpoint(void)
+int __init init_lwfp(void)
 {
+	int ret;
 	hash_init(lwfp_module);
 	spin_lock_init(&lwfp_module_lock);
 	hash_init(events_table);
 	spin_lock_init(&events_lock);
 
-	perf_pmu_register(&perf_sw_breakpoint, "sw_breakpoint", PERF_TYPE_SW_BREAKPOINT);
-	return register_die_notifier(&sw_breakpoint_exceptions_nb);
+	ret = perf_pmu_register(&perf_lwfp,
+				"lwfp_breakpoint",
+				PERF_TYPE_LWFP_BREAKPOINT);
+	if (ret)
+		return ret;
+	return register_die_notifier(&lwfp_exceptions_nb);
 }
 
-EXPORT_SYMBOL_GPL(unregister_sw_breakpoint);
+void unregister_lwfp(struct perf_event *event)
+{
+	if (!event) return;
+	perf_event_release_kernel(event);
+}
+EXPORT_SYMBOL_GPL(unregister_lwfp);
+
