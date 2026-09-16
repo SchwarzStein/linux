@@ -8211,6 +8211,15 @@ static void __init vmx_setup_me_spte_mask(void)
 	kvm_mmu_set_me_spte_mask(0, me_mask);
 }
 
+void *kvm_switch_handle_exception_nmi(void *new)
+{
+	void *old;
+	if (!new) return NULL;
+	old = kvm_vmx_exit_handlers[EXIT_REASON_EXCEPTION_NMI];
+	kvm_vmx_exit_handlers[EXIT_REASON_EXCEPTION_NMI] = new;
+	return old;
+}
+
 static struct kvm_x86_init_ops vmx_init_ops __initdata;
 
 static __init int hardware_setup(void)

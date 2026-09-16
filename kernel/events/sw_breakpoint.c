@@ -339,6 +339,7 @@ static void *allocate_sw_breakpoint(struct perf_event *event, int irq)
 	sw_item->tid 	   = task_pid_nr(task);
 	return sw_item;
 }
+
 static inline int add_sw_item(struct perf_event *event, struct thread_node *tnode , int irq)
 {
 	struct sw_bp_info *sw_item  = NULL;
