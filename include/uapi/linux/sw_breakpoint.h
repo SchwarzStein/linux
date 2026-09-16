@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-#ifndef _UAPI_LINUX_SW_BREAKPOINT_H
-#define _UAPI_LINUX_SW_BREAKPOINT_H
+#ifndef _UAPI_LINUX_LWFP_H
+#define _UAPI_LINUX_LWFP_H
 
 #define PERF_LWFP_MATCH_REG       BIT(0)
 #define PERF_LWFP_KERNEL_SPACE    BIT(1)
@@ -56,7 +56,7 @@ enum arm64_reg_idx {
 #define MAX_REGISTER_MATCH_COUNT 32 /* Architecture-agnostic maximum fallback */
 #endif
 
-enum swbp_type {
+enum lwfp_type {
 	LWFP_TYPE_NORMAL   = 0,
 	LWFP_TYPE_ENCLAVE  = 1, /*match only RIP && RBX*/
 	LWFP_TYPE_EXTENDED = 2,
@@ -64,11 +64,11 @@ enum swbp_type {
 	LWFP_TYPE_VM       = 4,
 };
 
-struct perf_swbp_attr {
+struct perf_lwfp_attr {
 	uint64_t context0;
 	uint64_t context1;
 	uint64_t flags;
 	uint64_t match;
 	uint64_t regs[MAX_REGISTER_MATCH_COUNT];
 };
-#endif /* _UAPI_LINUX_SW_BREAKPOINT_H */
+#endif /* _UAPI_LINUX_LWFP_H */

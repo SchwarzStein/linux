@@ -136,8 +136,8 @@ DEFINE_HASHTABLE(events_table, EVENT_HTABLE_WIDTH); /* allows quick searching of
 static spinlock_t lwfp_module_lock;
 static spinlock_t events_lock;
 
-void *kvm_switch_handle_notify(void *new);
-static int (*kvm_vmx_x86_exception_nmi)(struct kvm_vcpu *vcpu) = NULL;
++void *kvm_switch_handle_exception_nmi(void *new);
++static int (*kvm_vmx_x86_handle_exception_nmi)(struct kvm_vcpu *vcpu) = NULL;
 
 int sw_breakpoint_exceptions_notify(struct notifier_block *unused,
 					unsigned long val, void *data)
