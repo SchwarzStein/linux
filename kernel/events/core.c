@@ -3176,7 +3176,7 @@ static int perf_event_modify_attr(struct perf_event *event,
 	case PERF_TYPE_BREAKPOINT:
 		func = perf_event_modify_breakpoint;
 		break;
-	case PERF_TYPE_SW_BREAKPOINT:
+	case PERF_TYPE_LWFP:
 		func = perf_event_modify_sw_breakpoint;
 		break;
 	default:
