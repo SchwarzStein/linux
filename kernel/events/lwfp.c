@@ -42,9 +42,9 @@
 #include <linux/mmap_lock.h>
 
 #include <asm/ptrace.h>
-#include <linux/perf_event.h>
 #include <linux/kvm_host.h>
-#include <uapi/linux/sw_breakpoint.h>
+#include <uapi/linux/lwfp.h>
+#include <linux/perf_event.h>
 
 #define EVENT_HTABLE_WIDTH	16
 #define LWFP_MODULE_WIDTH	4
