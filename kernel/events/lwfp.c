@@ -210,13 +210,15 @@ DEFINE_HASHTABLE(events_table, EVENT_HTABLE_WIDTH);
 static spinlock_t lwfp_module_lock;
 static spinlock_t events_lock;
 
-#if defined(CONFIG_KVM)
+#if defined(CONFIG_HAVE_KVM)
+/*TODO: Fix the architecture dependent writes*/
 
 typedef int (*lwfp_kvm_nmi_handler_t)(struct kvm_vcpu *vcpu);
 
 extern void *kvm_switch_handle_exception_nmi(void *new_handler);
 
 static int lwfp_handle_kvm_exception_nmi(struct kvm_vcpu *vcpu);
+
 
 static int lwfp_default_kvm_handle_exception_nmi(struct kvm_vcpu *vcpu)
 {
@@ -358,6 +360,15 @@ static int lwfp_extended_handle_flags(struct lwfp *lwfp,
 	return 0;
 }
 
+#if defined(CONFIG_ARM64)
+void kvm_set_vcpu_ip(struct kvm_vcpu *vcpu, unsigned long new_pc) {
+    vcpu_gp_regs(vcpu)->pc = new_pc;
+
+    smp_wmb();
+    set_bit(KVM_REQ_EVENT & KVM_REQUEST_MASK, (unsigned long *)&vcpu->requests);
+}
+#endif
+
 static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 				 struct kvm_vcpu *vcpu,
 				 struct pt_regs *regs)
@@ -375,9 +386,11 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 		instruction_pointer_set(regs, ip);
 
 #if defined(CONFIG_X86_64)
-		kvm_rip_write(vcpu, ip);
+		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
+		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
+		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
 #elif defined(CONFIG_ARM64)
-		vcpu_gp_regs(vcpu)->pc = ip;
+		kvm_set_vcpu_ip(vcpu, ip);
 #else
 		return -EOPNOTSUPP;
 #endif
@@ -581,11 +594,35 @@ lwfp_handle_flags(struct lwfp *lwfp,
 	}
 }
 
+static bool unlink_empty_process(struct process_node *proc)
+{
+	bool removed = false;
+
+	if (!proc)
+		return false;
+
+	spin_lock(&proc->thread_lock);
+
+	if (hash_empty(proc->thread_hashtable)) {
+		spin_lock(&lwfp_module_lock);
+
+		if (!hlist_unhashed(&proc->node)) {
+			hash_del_rcu(&proc->node);
+			removed = true;
+		}
+		spin_unlock(&lwfp_module_lock);
+	}
+
+	spin_unlock(&proc->thread_lock);
+
+	return removed;
+}
+
+
 static int execute_event(struct lwfp *target,
 			struct pt_regs *regs,
 			struct lwfp_sgx_match_state *sgx_state)
 {
-	int ret;
 
 	if (!target || !target->event || !regs)
 		return 0;
@@ -593,23 +630,17 @@ static int execute_event(struct lwfp *target,
 	switch (target->type) {
 	case LWFP_TYPE_NORMAL:
 	case LWFP_TYPE_ENCLAVE:
-		return perf_bp_event(target->event, regs);
-
+		perf_bp_event(target->event, regs);
+		return 0;
 	case LWFP_TYPE_EXTENDED:
-		ret = perf_bp_event(target->event, regs);
-		if (ret)
-			return ret;
-
+		perf_bp_event(target->event, regs);
 		return lwfp_handle_flags(target, regs, NULL, NULL, 0);
 
 	case LWFP_TYPE_SGX:
 		if (!sgx_state || !sgx_state->gprs_valid)
 			return -EFAULT;
 
-		ret = perf_bp_event(target->event, &sgx_state->regs);
-		if (ret)
-			return ret;
-
+		perf_bp_event(target->event, &sgx_state->regs);
 		return lwfp_sgx_handle_flags(target,
 					     current,
 					     sgx_state->gprsgx_addr,
@@ -800,6 +831,7 @@ static int remove_process(pid_t pid)
 	return removed;
 }
 
+/*TODO: This is unused*/
 static struct thread_node *
 add_new_thread(struct process_node *node, pid_t tid)
 {
@@ -821,6 +853,7 @@ add_new_thread(struct process_node *node, pid_t tid)
 	return new_thread;
 }
 
+/*TODO: This is unused*/
 static struct process_node *
 add_new_process(pid_t pid)
 {
@@ -1222,9 +1255,8 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	if (!found)
 		return orig_ret;
 
-	ret = perf_bp_event(lwfp->event, regs);
-	if (!ret)
-		ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
+	perf_bp_event(lwfp->event, regs);
+	ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
 
 	lwfp_put(lwfp);
 
@@ -1234,39 +1266,40 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 #endif /* CONFIG_KVM */
 
 #if defined(CONFIG_X86_64) && defined(CONFIG_KVM)
+extern unsigned long kvm_get_rflags(struct kvm_vcpu *vcpu);
 
 static void
 lwfp_x86_get_regs_from_vcpu(struct kvm_vcpu *vcpu,
 			    struct pt_regs *regs)
 {
-	regs->ax = kvm_rax_read(vcpu);
-	regs->bx = kvm_rbx_read(vcpu);
-	regs->cx = kvm_rcx_read(vcpu);
-	regs->dx = kvm_rdx_read(vcpu);
-	regs->si = kvm_rsi_read(vcpu);
-	regs->di = kvm_rdi_read(vcpu);
-	regs->bp = kvm_rbp_read(vcpu);
-	regs->sp = kvm_rsp_read(vcpu);
-	regs->ip = kvm_rip_read(vcpu);
+	struct kvm_segment kvm_cs, kvm_ss;
 
-	regs->r8 = kvm_r8_read(vcpu);
-	regs->r9 = kvm_r9_read(vcpu);
-	regs->r10 = kvm_r10_read(vcpu);
-	regs->r11 = kvm_r11_read(vcpu);
-	regs->r12 = kvm_r12_read(vcpu);
-	regs->r13 = kvm_r13_read(vcpu);
-	regs->r14 = kvm_r14_read(vcpu);
-	regs->r15 = kvm_r15_read(vcpu);
+	if (!vcpu || !regs)
+		return;
 
-	regs->flags = static_call(kvm_x86_get_rflags)(vcpu);
-	regs->cs =
-		static_call(kvm_x86_get_segment)(
-			vcpu,
-			VCPU_SREG_CS).selector;
-	regs->ss =
-		static_call(kvm_x86_get_segment)(
-			vcpu,
-			VCPU_SREG_SS).selector;
+    regs->ax  = vcpu->arch.regs[VCPU_REGS_RAX];
+    regs->bx  = vcpu->arch.regs[VCPU_REGS_RBX];
+    regs->cx  = vcpu->arch.regs[VCPU_REGS_RCX];
+    regs->dx  = vcpu->arch.regs[VCPU_REGS_RDX];
+    regs->si  = vcpu->arch.regs[VCPU_REGS_RSI];
+    regs->di  = vcpu->arch.regs[VCPU_REGS_RDI];
+    regs->bp  = vcpu->arch.regs[VCPU_REGS_RBP];
+    regs->sp  = vcpu->arch.regs[VCPU_REGS_RSP];
+    regs->r8  = vcpu->arch.regs[VCPU_REGS_R8];
+    regs->r9  = vcpu->arch.regs[VCPU_REGS_R9];
+    regs->r10 = vcpu->arch.regs[VCPU_REGS_R10];
+    regs->r11 = vcpu->arch.regs[VCPU_REGS_R11];
+    regs->r12 = vcpu->arch.regs[VCPU_REGS_R12];
+    regs->r13 = vcpu->arch.regs[VCPU_REGS_R13];
+    regs->r14 = vcpu->arch.regs[VCPU_REGS_R14];
+    regs->r15 = vcpu->arch.regs[VCPU_REGS_R15];
+    regs->ip  = vcpu->arch.regs[VCPU_REGS_RIP];
+    regs->flags = kvm_get_rflags(vcpu);
+    static_call(kvm_x86_get_segment)(vcpu, &kvm_cs, VCPU_SREG_CS);
+    static_call(kvm_x86_get_segment)(vcpu, &kvm_ss, VCPU_SREG_SS);
+    regs->cs = kvm_cs.selector;
+    regs->ss = kvm_ss.selector;
+    regs->orig_ax = regs->ax;
 }
 
 static int
@@ -1429,6 +1462,67 @@ search_for_event(pid_t pid,
 	return lwfp;
 }
 
+static void lwfp_event_destroy(struct perf_event *event)
+{
+	struct process_node *proc_item = NULL;
+	struct thread_node *thread = NULL;
+	struct lwfp_event *bp_event;
+	struct lwfp *lwfp;
+	pid_t pid;
+	pid_t tid;
+
+	bp_event = search_for_lwfp(event);
+	if (!bp_event)
+		return;
+
+	lwfp = bp_event->value;
+	if (!lwfp || !refcount_inc_not_zero(&lwfp->refs)) {
+		lwfp_event_put(bp_event);
+		return;
+	}
+
+	pid = lwfp->t_pid;
+	tid = lwfp->t_tid;
+
+	spin_lock(&events_lock);
+
+	if (!hlist_unhashed(&bp_event->node))
+		hash_del_rcu(&bp_event->node);
+
+	spin_unlock(&events_lock);
+
+	lwfp_put(lwfp);
+
+	proc_item = lwfp_get_process_node(pid);
+	if (proc_item) {
+		thread = lwfp_get_thread_node(proc_item, tid);
+
+		if (thread) {
+			remove_and_free_lwfp(thread, lwfp);
+
+			spin_lock(&thread->lwfp_lock);
+
+			if (list_empty(&thread->lwfp_list))
+				remove_thread(proc_item, thread);
+
+			spin_unlock(&thread->lwfp_lock);
+
+			thread_node_put(thread);
+		}
+
+		if (unlink_empty_process(proc_item))
+			process_node_put(proc_item);
+
+		process_node_put(proc_item);
+	}
+
+	lwfp_put(lwfp);
+
+	lwfp_event_put(bp_event);
+
+	return;
+}
+
 static int lwfp_event_init(struct perf_event *event)
 {
 	struct process_node *proc_item = NULL;
@@ -1543,6 +1637,8 @@ static int lwfp_event_init(struct perf_event *event)
 	thread_node_put(thread);
 	process_node_put(proc_item);
 
+	event->destroy = lwfp_event_destroy;
+
 	return 0;
 
 event_cleanup:
@@ -1564,92 +1660,6 @@ process_cleanup:
 		remove_process(pid);
 
 	return ret;
-}
-
-static bool unlink_empty_process(struct process_node *proc)
-{
-	bool removed = false;
-
-	if (!proc)
-		return false;
-
-	spin_lock(&proc->thread_lock);
-
-	if (hash_empty(proc->thread_hashtable)) {
-		spin_lock(&lwfp_module_lock);
-
-		if (!hlist_unhashed(&proc->node)) {
-			hash_del_rcu(&proc->node);
-			removed = true;
-		}
-
-		spin_unlock(&lwfp_module_lock);
-	}
-
-	spin_unlock(&proc->thread_lock);
-
-	return removed;
-}
-
-static int lwfp_event_destroy(struct perf_event *event)
-{
-	struct process_node *proc_item = NULL;
-	struct thread_node *thread = NULL;
-	struct lwfp_event *bp_event;
-	struct lwfp *lwfp;
-	pid_t pid;
-	pid_t tid;
-
-	bp_event = search_for_lwfp(event);
-	if (!bp_event)
-		return 0;
-
-	lwfp = bp_event->value;
-	if (!lwfp || !refcount_inc_not_zero(&lwfp->refs)) {
-		lwfp_event_put(bp_event);
-		return 0;
-	}
-
-	pid = lwfp->t_pid;
-	tid = lwfp->t_tid;
-
-	spin_lock(&events_lock);
-
-	if (!hlist_unhashed(&bp_event->node))
-		hash_del_rcu(&bp_event->node);
-
-	spin_unlock(&events_lock);
-
-	lwfp_put(lwfp);
-
-	proc_item = lwfp_get_process_node(pid);
-	if (proc_item) {
-		thread = lwfp_get_thread_node(proc_item, tid);
-
-		if (thread) {
-			remove_and_free_lwfp(thread, lwfp);
-
-			spin_lock(&thread->lwfp_lock);
-
-			if (list_empty(&thread->lwfp_list))
-				remove_thread(proc_item, thread);
-
-			spin_unlock(&thread->lwfp_lock);
-
-			thread_node_put(thread);
-		}
-
-		if (unlink_empty_process(proc_item))
-			process_node_put(proc_item);
-
-		process_node_put(proc_item);
-	}
-
-	lwfp_put(lwfp);
-
-	lwfp_event_put(bp_event);
-
-	return 0;
 }
 
 static int lwfp_add(struct perf_event *event,
@@ -1687,7 +1697,6 @@ static struct pmu perf_lwfp = {
 	.start = lwfp_start,
 	.stop = lwfp_stop,
 	.read = lwfp_pmu_read,
-	.event_destroy = lwfp_event_destroy,
 };
 
 #if defined(CONFIG_KVM)
@@ -1724,7 +1733,7 @@ int __init init_lwfp(void)
 
 	ret = perf_pmu_register(&perf_lwfp,
 				"lwfp_breakpoint",
-				PERF_TYPE_LWFP_BREAKPOINT);
+				PERF_TYPE_LWFP);
 	if (ret)
 		return ret;
 

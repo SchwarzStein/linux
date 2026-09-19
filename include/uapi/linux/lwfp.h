@@ -8,11 +8,11 @@
 #define PERF_LWFP_MATCH_FLAGS     BIT(3)
 #define PERF_LWFP_MATCH_ENCLAVE   BIT(4)
 
-#define X86_64_REG_MAX (16)
-#define ARM64_REG_MAX  (32)
+#define LWFP_X86_64_REG_MAX 16
+#define LWFP_ARM64_REG_MAX  32
 
 #if defined(__x86_64__)
-#define MAX_REGISTER_MATCH_COUNT X86_64_REG_MAX
+#define MAX_REGISTER_MATCH_COUNT LWFP_X86_64_REG_MAX
 
 enum x86_64_reg_idx {
 	X86_REG_RAX = 0,
@@ -31,7 +31,6 @@ enum x86_64_reg_idx {
 	X86_REG_R13,
 	X86_REG_R14,
 	X86_REG_R15,
-	X86_64_REG_MAX
 };
 
 #elif defined(__aarch64__)
@@ -60,6 +59,9 @@ enum arm64_reg_idx {
 #define LWFP_FLAG_SINGLE_STEP	(1ULL << 1)
 #define LWFP_FLAG_GSREG 		(1ULL << 2)
 #define LWFP_FLAG_FSREG   		(1ULL << 3)
+
+/*TODO: compile guards*/
+extern int init_lwfp(void);
 
 struct perf_sgx_attr {
 	__u64 enclave_base;

@@ -38,6 +38,7 @@
 #include <linux/perf_event.h>
 #include <linux/trace_events.h>
 #include <linux/hw_breakpoint.h>
+#include <linux/lwfp.h>
 #include <linux/mm_types.h>
 #include <linux/module.h>
 #include <linux/mman.h>
@@ -13420,7 +13421,7 @@ static struct notifier_block perf_reboot_notifier = {
 	.notifier_call = perf_reboot,
 	.priority = INT_MIN,
 };
-extern int init_sw_breakpoint(void);
+
 void __init perf_event_init(void)
 {
 	int ret;
@@ -13439,7 +13440,7 @@ void __init perf_event_init(void)
 	ret = init_hw_breakpoint();
 	WARN(ret, "hw_breakpoint initialization failed with: %d", ret);
 
-	ret = init_sw_breakpoint();
+	ret = init_lwfp();
 	WARN(ret, "sw_breakpoint initialization failed with: %d", ret);
 
 	perf_event_cache = KMEM_CACHE(perf_event, SLAB_PANIC);

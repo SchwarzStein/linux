@@ -8219,6 +8219,7 @@ void *kvm_switch_handle_exception_nmi(void *new)
 	kvm_vmx_exit_handlers[EXIT_REASON_EXCEPTION_NMI] = new;
 	return old;
 }
+EXPORT_SYMBOL_GPL(kvm_switch_handle_exception_nmi);
 
 static struct kvm_x86_init_ops vmx_init_ops __initdata;
 
