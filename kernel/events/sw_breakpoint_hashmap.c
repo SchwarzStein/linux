@@ -37,6 +37,9 @@
 #include <linux/refcount.h>
 #include <linux/rcupdate.h>
 #include <linux/uaccess.h>
+#include <linux/atomic.h>
+#include <linux/mm.h>
+#include <linux/mmap_lock.h>
 
 #include <asm/ptrace.h>
 #include <linux/perf_event.h>
@@ -103,6 +106,44 @@ static const int arch_reg_offsets[MAX_REGISTER_MATCH_COUNT] = {
 };
 #endif
 
+/*
+ * SGX GPRSGX layout (Intel SDM, SSA GPRSGX area). 184 bytes.
+ */
+struct gprs {
+	u64 rax;
+	u64 rcx;
+	u64 rdx;
+	u64 rbx;
+	u64 rsp;
+	u64 rbp;
+	u64 rsi;
+	u64 rdi;
+	u64 r8;
+	u64 r9;
+	u64 r10;
+	u64 r11;
+	u64 r12;
+	u64 r13;
+	u64 r14;
+	u64 r15;
+	u64 rflags;
+	u64 rip;
+	u64 ursp;
+	u64 urbp;
+	u32 exitinfo;
+	u8 reserved[3];
+	u8 aexnotify;
+	u64 fsbase;
+	u64 gsbase;
+} __packed;
+
+typedef struct gprs gprs_t;
+
+static_assert(sizeof(gprs_t) == 184, "gprs_t must match SGX GPRSGX layout");
+
+#define SGX_GPRSGX_RFLAGS_OFFSET	offsetof(gprs_t, rflags)
+#define SGX_GPRSGX_RIP_OFFSET		offsetof(gprs_t, rip)
+
 struct lwfp {
 	u64 base_addr;
 	struct perf_event *event;
@@ -156,6 +197,13 @@ struct lwfp_context {
 	struct pt_regs *regs;
 };
 
+struct lwfp_sgx_match_state {
+	gprs_t gprs;
+	u64 gprsgx_addr;
+	bool gprs_valid;
+	struct pt_regs regs;
+};
+
 DEFINE_HASHTABLE(lwfp_module, LWFP_MODULE_WIDTH);
 DEFINE_HASHTABLE(events_table, EVENT_HTABLE_WIDTH);
 
@@ -163,16 +211,36 @@ static spinlock_t lwfp_module_lock;
 static spinlock_t events_lock;
 
 #if defined(CONFIG_KVM)
-typedef int (*lwfp_kvm_nmi_handler_t)(struct kvm_vcpu *vcpu);
-#endif
 
-#if defined(CONFIG_X86_64) && defined(CONFIG_KVM)
-static lwfp_kvm_nmi_handler_t kvm_vmx_x86_handle_exception_nmi;
-#endif
+typedef int (*lwfp_kvm_nmi_handler_t)(struct kvm_vcpu *vcpu);
+
+extern void *kvm_switch_handle_exception_nmi(void *new_handler);
+
+static int lwfp_handle_kvm_exception_nmi(struct kvm_vcpu *vcpu);
+
+static int lwfp_default_kvm_handle_exception_nmi(struct kvm_vcpu *vcpu)
+{
+	(void)vcpu;
+
+	return 0;
+}
+
+static atomic_long_t kvm_handle_exception_nmi =
+	ATOMIC_LONG_INIT((long)lwfp_default_kvm_handle_exception_nmi);
+
+/*
+ * This is the handler returned by KVM when the local LWFP handler
+ * is installed. It is passed back to KVM during restoration.
+ */
+static void *kvm_original_handle_exception_nmi;
+
+#endif /* CONFIG_KVM */
 
 static struct lwfp *search_for_event(pid_t pid, pid_t tid,
-				     struct pt_regs *regs);
-static int execute_event(struct lwfp *target, struct pt_regs *regs);
+				     struct pt_regs *regs,
+				     struct lwfp_sgx_match_state *sgx_state);
+static int execute_event(struct lwfp *target, struct pt_regs *regs,
+			struct lwfp_sgx_match_state *sgx_state);
 
 static void lwfp_rcu_free(struct rcu_head *rcu)
 {
@@ -265,10 +333,262 @@ lwfp_match_regs_attr(const struct perf_lwfp_attr *attr,
 	return count > 0;
 }
 
-static int execute_event(struct lwfp *target, struct pt_regs *regs)
+static int lwfp_extended_handle_flags(struct lwfp *lwfp,
+				      struct pt_regs *regs)
 {
+	u64 flags;
+
+	if (!lwfp || !lwfp->attr || !regs)
+		return -EINVAL;
+
+	flags = lwfp->attr->flags;
+
+	if (flags & LWFP_FLAG_IP_INC)
+		instruction_pointer_set(regs,
+					instruction_pointer(regs) + 1);
+
+#if defined(CONFIG_X86_64)
+	if (flags & LWFP_FLAG_SINGLE_STEP)
+		regs->flags |= X86_EFLAGS_TF;
+#elif defined(CONFIG_ARM64)
+	if (flags & LWFP_FLAG_SINGLE_STEP)
+		regs->pstate |= PSR_D_BIT;
+#endif
+
+	return 0;
+}
+
+static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
+				 struct kvm_vcpu *vcpu,
+				 struct pt_regs *regs)
+{
+	u64 flags;
+	unsigned long ip;
+
+	if (!lwfp || !lwfp->attr || !vcpu || !regs)
+		return -EINVAL;
+
+	flags = lwfp->attr->flags;
+
+	if (flags & LWFP_FLAG_IP_INC) {
+		ip = instruction_pointer(regs) + 1;
+		instruction_pointer_set(regs, ip);
+
+#if defined(CONFIG_X86_64)
+		kvm_rip_write(vcpu, ip);
+#elif defined(CONFIG_ARM64)
+		vcpu_gp_regs(vcpu)->pc = ip;
+#else
+		return -EOPNOTSUPP;
+#endif
+	}
+
+	if (flags & LWFP_FLAG_SINGLE_STEP) {
+		vcpu->guest_debug |=
+			KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP;
+	}
+
+	return 0;
+}
+
+/*
+ * Validate that [addr, addr + len) is:
+ *   - a userspace range (access_ok())
+ *   - fully contained within a single VMA belonging to task->mm
+ *
+ * This must be called before any read/write into enclave memory,
+ * since gprsgx_addr is derived from user-controlled enclave_base,
+ * ssa_size, and TCS values.
+ */
+static int lwfp_sgx_validate_user_range(struct task_struct *task,
+					unsigned long addr,
+					size_t len)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	int ret = -EFAULT;
+
+	if (!task || !task->mm || !len)
+		return -EINVAL;
+
+	if (addr + len < addr)
+		return -EOVERFLOW;
+
+	if (!access_ok((void __user *)addr, len))
+		return -EFAULT;
+
+	mm = task->mm;
+
+	mmap_read_lock(mm);
+
+	vma = find_vma(mm, addr);
+	if (!vma || vma->vm_start > addr)
+		goto out_unlock;
+
+	if (addr + len > vma->vm_end)
+		goto out_unlock;
+
+	/*
+	 * The enclave mapping must not be writable/executable from the
+	 * kernel's point of view in ways that indicate it isn't the
+	 * expected SGX enclave VMA. At minimum, require that it is a
+	 * valid, non-special mapping.
+	 */
+	if (vma->vm_flags & VM_SPECIAL)
+		goto out_unlock;
+
+	ret = 0;
+
+out_unlock:
+	mmap_read_unlock(mm);
+
+	return ret;
+}
+
+/*
+ * Compute the GPRSGX address for a given TCS within the enclave,
+ * validating that the resulting address range lies within the
+ * task's enclave VMA before returning it.
+ */
+static void *
+lwfp_sgx_get_gprsgx_addr(struct task_struct *task,
+			 u64 enclave_base,
+			 u64 tcs_addr,
+			 u32 ssa_size)
+{
+	u64 gprsgx_addr;
+	int ret;
+
+	if (!task || !enclave_base || !tcs_addr || !ssa_size)
+		return NULL;
+
+	/*
+	 * The exact SSA/GPRSGX offset calculation depends on the SGX
+	 * layout used by this driver's enclave loader (SSA frame index,
+	 * XSAVE area size, etc). ssa_size here represents the fixed
+	 * per-SSA-frame size preceding the GPRSGX region.
+	 */
+	if (check_add_overflow(tcs_addr, (u64)ssa_size, &gprsgx_addr))
+		return NULL;
+
+	ret = lwfp_sgx_validate_user_range(task,
+					   (unsigned long)gprsgx_addr,
+					   sizeof(gprs_t));
+	if (ret)
+		return NULL;
+
+	return (void *)(unsigned long)gprsgx_addr;
+}
+
+/*
+ * Read or write the GPRSGX area for a remote task, after validating
+ * that [addr, addr + len) is a userspace range fully contained in
+ * the task's mm.
+ */
+static int lwfp_sgx_access_enclave(struct task_struct *task,
+				   unsigned long addr,
+				   void *buf,
+				   size_t len,
+				   bool write)
+{
+	int ret;
+	int access_ret;
+
+	if (!task || !task->mm || !addr || !buf || !len)
+		return -EINVAL;
+
+	ret = lwfp_sgx_validate_user_range(task, addr, len);
+	if (ret)
+		return ret;
+
+	access_ret = access_process_vm(task,
+				       addr,
+				       buf,
+				       len,
+				       write ? FOLL_WRITE : 0);
+	if (access_ret != len)
+		return -EFAULT;
+
+	return 0;
+}
+
+static int lwfp_sgx_handle_flags(struct lwfp *lwfp,
+				 struct task_struct *task,
+				 u64 gprsgx_addr,
+				 struct pt_regs *regs)
+{
+	u64 value;
+	int ret;
+
+	if (!lwfp || !lwfp->attr || !task || !gprsgx_addr || !regs)
+		return -EINVAL;
+
+	if (lwfp->attr->flags & LWFP_FLAG_IP_INC) {
+		value = instruction_pointer(regs) + 1;
+
+		ret = lwfp_sgx_access_enclave(
+			task,
+			gprsgx_addr + SGX_GPRSGX_RIP_OFFSET,
+			&value,
+			sizeof(value),
+			true);
+		if (ret)
+			return ret;
+
+		instruction_pointer_set(regs, value);
+	}
+
+	if (lwfp->attr->flags & LWFP_FLAG_SINGLE_STEP) {
+		value = regs->flags | X86_EFLAGS_TF;
+
+		ret = lwfp_sgx_access_enclave(
+			task,
+			gprsgx_addr + SGX_GPRSGX_RFLAGS_OFFSET,
+			&value,
+			sizeof(value),
+			true);
+		if (ret)
+			return ret;
+
+		regs->flags = value;
+	}
+
+	return 0;
+}
+
+static int
+lwfp_handle_flags(struct lwfp *lwfp,
+		  struct pt_regs *regs,
+		  struct kvm_vcpu *vcpu,
+		  struct task_struct *task,
+		  u64 gprsgx_addr)
+{
+	if (!lwfp || !lwfp->attr || !lwfp->attr->flags)
+		return 0;
+
+	switch (lwfp->type) {
+	case LWFP_TYPE_EXTENDED:
+		return lwfp_extended_handle_flags(lwfp, regs);
+
+	case LWFP_TYPE_VM:
+		return lwfp_kvm_handle_flags(lwfp, vcpu, regs);
+
+	case LWFP_TYPE_SGX:
+		return lwfp_sgx_handle_flags(lwfp, task, gprsgx_addr, regs);
+
+	default:
+		return 0;
+	}
+}
+
+static int execute_event(struct lwfp *target,
+			struct pt_regs *regs,
+			struct lwfp_sgx_match_state *sgx_state)
+{
+	int ret;
+
 	if (!target || !target->event || !regs)
-		return NOTIFY_DONE;
+		return 0;
 
 	switch (target->type) {
 	case LWFP_TYPE_NORMAL:
@@ -276,25 +596,47 @@ static int execute_event(struct lwfp *target, struct pt_regs *regs)
 		return perf_bp_event(target->event, regs);
 
 	case LWFP_TYPE_EXTENDED:
+		ret = perf_bp_event(target->event, regs);
+		if (ret)
+			return ret;
+
+		return lwfp_handle_flags(target, regs, NULL, NULL, 0);
+
 	case LWFP_TYPE_SGX:
+		if (!sgx_state || !sgx_state->gprs_valid)
+			return -EFAULT;
+
+		ret = perf_bp_event(target->event, &sgx_state->regs);
+		if (ret)
+			return ret;
+
+		return lwfp_sgx_handle_flags(target,
+					     current,
+					     sgx_state->gprsgx_addr,
+					     &sgx_state->regs);
+
 	case LWFP_TYPE_VM:
-		/*
-		 * Type-specific post-processing can be added here.
-		 */
-		return NOTIFY_STOP;
+		pr_err_ratelimited(
+			"lwfp: unexpected LWFP_TYPE_VM in INT3 notifier; "
+			"VM breakpoints must be handled by the KVM exception/NMI path\n");
+		return -EOPNOTSUPP;
 
 	default:
-		return NOTIFY_DONE;
+		return 0;
 	}
 }
 
 int lwfp_exceptions_notify(struct notifier_block *unused,
-			   unsigned long val, void *data)
+			   unsigned long val,
+			   void *data)
 {
 	struct die_args *args = data;
+	struct lwfp_sgx_match_state sgx_state = {};
 	struct pt_regs *regs;
 	struct lwfp *lwfp;
 	int ret;
+
+	sgx_state.gprs_valid = 0;
 
 	if (val != DIE_INT3)
 		return NOTIFY_DONE;
@@ -308,14 +650,20 @@ int lwfp_exceptions_notify(struct notifier_block *unused,
 		return NOTIFY_DONE;
 
 	lwfp = search_for_event(task_tgid_nr(current),
-				task_pid_nr(current), regs);
+				task_pid_nr(current),
+				regs,
+				&sgx_state);
 	if (!lwfp)
 		return NOTIFY_DONE;
 
-	ret = execute_event(lwfp, regs);
+	ret = execute_event(lwfp, regs, &sgx_state);
+
 	lwfp_put(lwfp);
 
-	return ret;
+	if (ret < 0)
+		return NOTIFY_DONE;
+
+	return ret ? NOTIFY_STOP : NOTIFY_DONE;
 }
 
 static struct notifier_block lwfp_exceptions_nb = {
@@ -332,11 +680,13 @@ static int remove_and_free_lwfp(struct thread_node *thread,
 		return 0;
 
 	spin_lock(&thread->lwfp_lock);
+
 	if (!bp->removed) {
 		bp->removed = true;
 		list_del_rcu(&bp->node);
 		removed = true;
 	}
+
 	spin_unlock(&thread->lwfp_lock);
 
 	if (removed)
@@ -354,10 +704,12 @@ static int remove_thread(struct process_node *proc,
 		return 0;
 
 	spin_lock(&proc->thread_lock);
+
 	if (!hlist_unhashed(&thread->node)) {
 		hash_del_rcu(&thread->node);
 		removed = true;
 	}
+
 	spin_unlock(&proc->thread_lock);
 
 	if (removed)
@@ -367,7 +719,7 @@ static int remove_thread(struct process_node *proc,
 }
 
 static struct thread_node *
-get_thread_node(struct process_node *proc, pid_t tid)
+lwfp_get_thread_node(struct process_node *proc, pid_t tid)
 {
 	struct thread_node *thread;
 
@@ -376,8 +728,10 @@ get_thread_node(struct process_node *proc, pid_t tid)
 
 	rcu_read_lock();
 
-	hash_for_each_possible_rcu(proc->thread_hashtable, thread,
-				   node, tid) {
+	hash_for_each_possible_rcu(proc->thread_hashtable,
+				   thread,
+				   node,
+				   tid) {
 		if (thread->tid == tid &&
 		    refcount_inc_not_zero(&thread->refcount)) {
 			rcu_read_unlock();
@@ -386,11 +740,12 @@ get_thread_node(struct process_node *proc, pid_t tid)
 	}
 
 	rcu_read_unlock();
+
 	return NULL;
 }
 
 static struct process_node *
-get_process_node(pid_t pid)
+lwfp_get_process_node(pid_t pid)
 {
 	struct process_node *proc;
 
@@ -405,6 +760,7 @@ get_process_node(pid_t pid)
 	}
 
 	rcu_read_unlock();
+
 	return NULL;
 }
 
@@ -414,7 +770,7 @@ static int remove_process(pid_t pid)
 	bool empty;
 	bool removed = false;
 
-	proc = get_process_node(pid);
+	proc = lwfp_get_process_node(pid);
 	if (!proc)
 		return 0;
 
@@ -428,16 +784,16 @@ static int remove_process(pid_t pid)
 	}
 
 	spin_lock(&lwfp_module_lock);
+
 	if (!hlist_unhashed(&proc->node)) {
 		hash_del_rcu(&proc->node);
 		removed = true;
 	}
+
 	spin_unlock(&lwfp_module_lock);
 
-	/* Drop the lookup reference. */
 	process_node_put(proc);
 
-	/* Drop the hash-table ownership reference. */
 	if (removed)
 		process_node_put(proc);
 
@@ -510,6 +866,9 @@ static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr,
 	if (!header.ssa_size || !header.tcs_count)
 		return -EINVAL;
 
+	if (header.tcs_count > ARRAY_SIZE(header.tcs_bases))
+		return -EINVAL;
+
 	if (header.tcs_count >
 	    (SIZE_MAX - sizeof(header)) / sizeof(header.tcs_bases[0]))
 		return -EOVERFLOW;
@@ -547,7 +906,9 @@ handle_sgx_lwfp(const struct perf_event_attr *event_attr)
 	if (!lwfp_attr)
 		return ERR_PTR(-ENOMEM);
 
-	if (copy_from_user(lwfp_attr, user_attr, sizeof(*lwfp_attr))) {
+	if (copy_from_user(lwfp_attr,
+			   user_attr,
+			   sizeof(*lwfp_attr))) {
 		ret = -EFAULT;
 		goto err_attr;
 	}
@@ -585,11 +946,13 @@ err_sgx:
 	kfree(sgx_attr);
 err_attr:
 	kfree(lwfp_attr);
+
 	return ERR_PTR(ret);
 }
 
 static struct lwfp *
-add_new_lwfp(struct perf_event *event, struct thread_node *target)
+add_new_lwfp(struct perf_event *event,
+	     struct thread_node *target)
 {
 	struct lwfp *lwfp;
 	unsigned long count;
@@ -606,18 +969,19 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 		if (event->attr.bp_type == LWFP_TYPE_VM ||
 		    event->attr.bp_type == LWFP_TYPE_EXTENDED) {
 			if (!event->attr.config2)
-				goto error_alloc;
+				goto error_attr_alloc;
 
-			lwfp->attr = kzalloc(sizeof(*lwfp->attr), GFP_KERNEL);
+			lwfp->attr = kzalloc(sizeof(*lwfp->attr),
+					     GFP_KERNEL);
 			if (!lwfp->attr)
-				goto error_alloc;
+				goto error_attr_alloc;
 
 			count = copy_from_user(
 				lwfp->attr,
 				u64_to_user_ptr(event->attr.config2),
 				sizeof(*lwfp->attr));
 			if (count != 0)
-				goto error_alloc;
+				goto error_copy;
 		}
 	}
 
@@ -636,15 +1000,18 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 
 	return lwfp;
 
-error_alloc:
-	kfree(lwfp->sgx_attr);
+error_copy:
 	kfree(lwfp->attr);
+
+error_attr_alloc:
 	kfree(lwfp);
+
 	return NULL;
 }
 
 static struct lwfp_event *
-create_lwfp_event(struct perf_event *event, struct lwfp *lwfp)
+create_lwfp_event(struct perf_event *event,
+		  struct lwfp *lwfp)
 {
 	struct lwfp_event *new_node;
 
@@ -666,7 +1033,9 @@ search_for_lwfp(struct perf_event *event)
 
 	rcu_read_lock();
 
-	hash_for_each_possible_rcu(events_table, target_event, node,
+	hash_for_each_possible_rcu(events_table,
+				   target_event,
+				   node,
 				   (unsigned long)event) {
 		if (target_event->event == event &&
 		    refcount_inc_not_zero(&target_event->refs)) {
@@ -676,30 +1045,121 @@ search_for_lwfp(struct perf_event *event)
 	}
 
 	rcu_read_unlock();
+
 	return NULL;
 }
 
 static inline int
-match_lwfp_extended(struct lwfp *lwfp, struct pt_regs *regs)
+lwfp_match_extended(struct lwfp *lwfp,
+		    struct pt_regs *regs)
 {
-	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL, regs);
+	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL,
+				    regs);
 }
 
 static inline int
-match_lwfp_vm(struct lwfp *lwfp, struct pt_regs *regs)
+lwfp_match_vm(struct lwfp *lwfp,
+	      struct pt_regs *regs)
 {
-	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL, regs);
+	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL,
+				    regs);
 }
 
-static inline int
-match_lwfp_sgx(struct lwfp *lwfp, struct pt_regs *regs)
+/*
+ * SGX matching:
+ *   1. regs->bx (host exception context) is the current TCS.
+ *   2. Confirm the TCS belongs to this lwfp's enclave.
+ *   3. Compute + validate the GPRSGX address (userspace, in-VMA).
+ *   4. Read the GPRSGX area once and cache it in sgx_state.
+ *   5. Rebuild a local pt_regs from the cached gprs_t.
+ *   6. Run the generic attribute matcher against that local
+ *      pt_regs; this handles the enclave-internal IP automatically
+ *      via sgx_regs.ip.
+ *
+ * The host regs->ip (interruption IP) is never compared here.
+ */
+static int
+lwfp_match_sgx(struct lwfp *lwfp,
+	       struct task_struct *task,
+	       struct pt_regs *regs,
+	       struct lwfp_sgx_match_state *state)
 {
-	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL, regs);
+	u64 tcs_addr;
+	size_t i;
+	int ret;
+
+	if (!lwfp || !lwfp->attr || !lwfp->sgx_attr ||
+	    !task || !regs || !state)
+		return -EINVAL;
+
+	tcs_addr = regs->bx;
+	if (!tcs_addr)
+		return 0;
+
+	for (i = 0; i < lwfp->sgx_attr->tcs_count; i++) {
+		if (lwfp->sgx_attr->tcs_bases[i] == tcs_addr)
+			break;
+	}
+
+	if (i == lwfp->sgx_attr->tcs_count)
+		return 0;
+
+	if (!state->gprs_valid) {
+		void *addr;
+
+		addr = lwfp_sgx_get_gprsgx_addr(
+			task,
+			lwfp->sgx_attr->enclave_base,
+			tcs_addr,
+			lwfp->sgx_attr->ssa_size);
+		if (!addr)
+			return -EFAULT;
+
+		state->gprsgx_addr = (u64)(unsigned long)addr;
+
+		ret = lwfp_sgx_access_enclave(
+			task,
+			(unsigned long)state->gprsgx_addr,
+			&state->gprs,
+			sizeof(state->gprs),
+			false);
+		if (ret)
+			return ret;
+
+		state->gprs_valid = true;
+	}
+
+	memset(&state->regs, 0, sizeof(state->regs));
+
+	state->regs.ax = state->gprs.rax;
+	state->regs.bx = state->gprs.rbx;
+	state->regs.cx = state->gprs.rcx;
+	state->regs.dx = state->gprs.rdx;
+	state->regs.si = state->gprs.rsi;
+	state->regs.di = state->gprs.rdi;
+	state->regs.bp = state->gprs.rbp;
+	state->regs.sp = state->gprs.rsp;
+
+	state->regs.r8 = state->gprs.r8;
+	state->regs.r9 = state->gprs.r9;
+	state->regs.r10 = state->gprs.r10;
+	state->regs.r11 = state->gprs.r11;
+	state->regs.r12 = state->gprs.r12;
+	state->regs.r13 = state->gprs.r13;
+	state->regs.r14 = state->gprs.r14;
+	state->regs.r15 = state->gprs.r15;
+
+	state->regs.flags = state->gprs.rflags;
+	state->regs.ip = state->gprs.rip;
+
+	return lwfp_match_regs_attr(lwfp->attr, &state->regs);
 }
 
 #if defined(CONFIG_KVM)
 
-int lwfp_handle_kvm_regs(struct kvm_vcpu *vcpu, struct pt_regs *regs)
+int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
+				      struct pt_regs *regs,
+				      int orig_ret)
 {
 	struct process_node *proc_item;
 	struct thread_node *thread_item;
@@ -709,38 +1169,42 @@ int lwfp_handle_kvm_regs(struct kvm_vcpu *vcpu, struct pt_regs *regs)
 	int found = 0;
 	int ret;
 
-	if (!vcpu || !regs)
-		return NOTIFY_DONE;
+	if (orig_ret < 0 || !vcpu || !regs)
+		return orig_ret;
 
-	if (!(vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP))
-		return NOTIFY_DONE;
+	if ((vcpu->guest_debug &
+	     (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP)) !=
+	    (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP))
+		return orig_ret;
 
 	if (vcpu->run->exit_reason != KVM_EXIT_DEBUG)
-		return NOTIFY_DONE;
+		return orig_ret;
 
 	pid = task_tgid_nr(current);
 	tid = task_pid_nr(current);
 
-	proc_item = get_process_node(pid);
+	proc_item = lwfp_get_process_node(pid);
 	if (!proc_item)
-		return NOTIFY_DONE;
+		return orig_ret;
 
-	thread_item = get_thread_node(proc_item, tid);
+	thread_item = lwfp_get_thread_node(proc_item, tid);
 	if (!thread_item) {
 		process_node_put(proc_item);
-		return NOTIFY_DONE;
+		return orig_ret;
 	}
 
 	rcu_read_lock();
 
-	list_for_each_entry_rcu(lwfp, &thread_item->lwfp_list, node) {
+	list_for_each_entry_rcu(lwfp,
+				 &thread_item->lwfp_list,
+				 node) {
 		if (lwfp->type != LWFP_TYPE_VM)
 			continue;
 
 		if (instruction_pointer(regs) != lwfp->config1)
 			continue;
 
-		if (!match_lwfp_vm(lwfp, regs))
+		if (!lwfp_match_vm(lwfp, regs))
 			continue;
 
 		if (!refcount_inc_not_zero(&lwfp->refs))
@@ -756,12 +1220,15 @@ int lwfp_handle_kvm_regs(struct kvm_vcpu *vcpu, struct pt_regs *regs)
 	process_node_put(proc_item);
 
 	if (!found)
-		return NOTIFY_DONE;
+		return orig_ret;
 
 	ret = perf_bp_event(lwfp->event, regs);
+	if (!ret)
+		ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
+
 	lwfp_put(lwfp);
 
-	return ret;
+	return ret ? ret : 1;
 }
 
 #endif /* CONFIG_KVM */
@@ -793,29 +1260,30 @@ lwfp_x86_get_regs_from_vcpu(struct kvm_vcpu *vcpu,
 
 	regs->flags = static_call(kvm_x86_get_rflags)(vcpu);
 	regs->cs =
-		static_call(kvm_x86_get_segment)(vcpu, VCPU_SREG_CS).selector;
+		static_call(kvm_x86_get_segment)(
+			vcpu,
+			VCPU_SREG_CS).selector;
 	regs->ss =
-		static_call(kvm_x86_get_segment)(vcpu, VCPU_SREG_SS).selector;
+		static_call(kvm_x86_get_segment)(
+			vcpu,
+			VCPU_SREG_SS).selector;
 }
 
 static int
 lwfp_x86_handle_kvm_nmi(struct kvm_vcpu *vcpu)
 {
 	struct pt_regs regs;
-	int ret;
-
-	if (kvm_vmx_x86_handle_exception_nmi) {
-		ret = kvm_vmx_x86_handle_exception_nmi(vcpu);
-		if (ret != NOTIFY_DONE)
-			return ret;
-	}
+	int orig_ret;
 
 	if (!vcpu)
-		return NOTIFY_DONE;
+		return 0;
+
+	orig_ret = ((lwfp_kvm_nmi_handler_t)
+		    atomic_long_read(&kvm_handle_exception_nmi))(vcpu);
 
 	lwfp_x86_get_regs_from_vcpu(vcpu, &regs);
 
-	return lwfp_handle_kvm_regs(vcpu, &regs);
+	return lwfp_handle_kvm_exception_context(vcpu, &regs, orig_ret);
 }
 
 #endif /* CONFIG_X86_64 && CONFIG_KVM */
@@ -843,13 +1311,17 @@ static int
 lwfp_arm64_handle_kvm_nmi(struct kvm_vcpu *vcpu)
 {
 	struct pt_regs regs;
+	int orig_ret;
 
 	if (!vcpu)
-		return NOTIFY_DONE;
+		return 0;
+
+	orig_ret = ((lwfp_kvm_nmi_handler_t)
+		    atomic_long_read(&kvm_handle_exception_nmi))(vcpu);
 
 	lwfp_arm64_get_regs_from_vcpu(vcpu, &regs);
 
-	return lwfp_handle_kvm_regs(vcpu, &regs);
+	return lwfp_handle_kvm_exception_context(vcpu, &regs, orig_ret);
 }
 
 #endif /* CONFIG_ARM64 && CONFIG_KVM */
@@ -863,28 +1335,31 @@ int lwfp_handle_kvm_exception_nmi(struct kvm_vcpu *vcpu)
 #elif defined(CONFIG_ARM64) && defined(CONFIG_KVM)
 	return lwfp_arm64_handle_kvm_nmi(vcpu);
 #else
-	return NOTIFY_DONE;
+	return 1;
 #endif
 }
 
 #endif /* CONFIG_KVM */
 
 static struct lwfp *
-search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
+search_for_event(pid_t pid,
+		 pid_t tid,
+		 struct pt_regs *regs,
+		 struct lwfp_sgx_match_state *sgx_state)
 {
 	struct process_node *proc_item;
 	struct thread_node *thread_item;
 	struct lwfp *lwfp;
 	int found = 0;
 
-	if (!regs)
+	if (!regs || !sgx_state)
 		return NULL;
 
-	proc_item = get_process_node(pid);
+	proc_item = lwfp_get_process_node(pid);
 	if (!proc_item)
 		return NULL;
 
-	thread_item = get_thread_node(proc_item, tid);
+	thread_item = lwfp_get_thread_node(proc_item, tid);
 	if (!thread_item) {
 		process_node_put(proc_item);
 		return NULL;
@@ -892,12 +1367,14 @@ search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
 
 	rcu_read_lock();
 
-	list_for_each_entry_rcu(lwfp, &thread_item->lwfp_list, node) {
-		if (instruction_pointer(regs) != lwfp->config1)
-			continue;
-
+	list_for_each_entry_rcu(lwfp,
+				&thread_item->lwfp_list,
+				node) {
 		switch (lwfp->type) {
 		case LWFP_TYPE_NORMAL:
+			if (instruction_pointer(regs) != lwfp->config1)
+				continue;
+
 			found = 1;
 			break;
 
@@ -909,15 +1386,25 @@ search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
 			break;
 
 		case LWFP_TYPE_EXTENDED:
-			found = match_lwfp_extended(lwfp, regs);
+			if (instruction_pointer(regs) != lwfp->config1)
+				continue;
+
+			found = lwfp_match_extended(lwfp, regs);
 			break;
 
 		case LWFP_TYPE_SGX:
-			found = match_lwfp_sgx(lwfp, regs);
+			found = lwfp_match_sgx(lwfp,
+					       current,
+					       regs,
+					       sgx_state);
 			break;
 
 		case LWFP_TYPE_VM:
-			found = match_lwfp_vm(lwfp, regs);
+			pr_err_ratelimited(
+				"lwfp: unsupported LWFP_TYPE_VM in "
+				"search_for_event(); VM breakpoints must "
+				"be handled by the KVM exception/NMI path\n");
+			found = -EINVAL;
 			break;
 
 		default:
@@ -928,7 +1415,7 @@ search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
 			break;
 	}
 
-	if (found && !refcount_inc_not_zero(&lwfp->refs))
+	if (found > 0 && !refcount_inc_not_zero(&lwfp->refs))
 		found = 0;
 
 	rcu_read_unlock();
@@ -936,7 +1423,7 @@ search_for_event(pid_t pid, pid_t tid, struct pt_regs *regs)
 	thread_node_put(thread_item);
 	process_node_put(proc_item);
 
-	if (!found)
+	if (found <= 0)
 		return NULL;
 
 	return lwfp;
@@ -981,7 +1468,9 @@ static int lwfp_event_init(struct perf_event *event)
 			hash_init(proc_item->thread_hashtable);
 			refcount_set(&proc_item->refcount, 2);
 
-			hash_add_rcu(lwfp_module, &proc_item->node, pid);
+			hash_add_rcu(lwfp_module,
+				     &proc_item->node,
+				     pid);
 			process_created = true;
 		}
 	}
@@ -993,8 +1482,10 @@ static int lwfp_event_init(struct perf_event *event)
 
 	spin_lock(&proc_item->thread_lock);
 
-	hash_for_each_possible(proc_item->thread_hashtable, thread,
-			       node, tid) {
+	hash_for_each_possible(proc_item->thread_hashtable,
+			       thread,
+			       node,
+			       tid) {
 		if (thread->tid == tid) {
 			refcount_inc(&thread->refcount);
 			break;
@@ -1010,7 +1501,8 @@ static int lwfp_event_init(struct perf_event *event)
 			refcount_set(&thread->refcount, 2);
 
 			hash_add_rcu(proc_item->thread_hashtable,
-				     &thread->node, tid);
+				     &thread->node,
+				     tid);
 			thread_created = true;
 		}
 	}
@@ -1030,7 +1522,9 @@ static int lwfp_event_init(struct perf_event *event)
 
 	spin_lock(&events_lock);
 
-	hash_for_each_possible(events_table, existing_event, node,
+	hash_for_each_possible(events_table,
+			       existing_event,
+			       node,
 			       (unsigned long)event) {
 		if (existing_event->event == event) {
 			spin_unlock(&events_lock);
@@ -1039,7 +1533,8 @@ static int lwfp_event_init(struct perf_event *event)
 		}
 	}
 
-	hash_add_rcu(events_table, &target_event->node,
+	hash_add_rcu(events_table,
+		     &target_event->node,
 		     (unsigned long)event);
 	refcount_inc(&lwfp->refs);
 
@@ -1125,22 +1620,20 @@ static int lwfp_event_destroy(struct perf_event *event)
 
 	spin_unlock(&events_lock);
 
-	/*
-	 * Drop the event-table reference. The local LWFP reference keeps
-	 * the object alive during cleanup.
-	 */
 	lwfp_put(lwfp);
 
-	proc_item = get_process_node(pid);
+	proc_item = lwfp_get_process_node(pid);
 	if (proc_item) {
-		thread = get_thread_node(proc_item, tid);
+		thread = lwfp_get_thread_node(proc_item, tid);
 
 		if (thread) {
 			remove_and_free_lwfp(thread, lwfp);
 
 			spin_lock(&thread->lwfp_lock);
+
 			if (list_empty(&thread->lwfp_list))
 				remove_thread(proc_item, thread);
+
 			spin_unlock(&thread->lwfp_lock);
 
 			thread_node_put(thread);
@@ -1152,30 +1645,32 @@ static int lwfp_event_destroy(struct perf_event *event)
 		process_node_put(proc_item);
 	}
 
-	/* Drop the local LWFP reference. */
 	lwfp_put(lwfp);
 
-	/* Drop the lookup reference from search_for_lwfp(). */
 	lwfp_event_put(bp_event);
 
 	return 0;
 }
 
-static int lwfp_add(struct perf_event *event, int flags)
+static int lwfp_add(struct perf_event *event,
+		    int flags)
 {
 	return 0;
 }
 
-static void lwfp_del(struct perf_event *event, int flags)
+static void lwfp_del(struct perf_event *event,
+		     int flags)
 {
 }
 
-static void lwfp_start(struct perf_event *event, int flags)
+static void lwfp_start(struct perf_event *event,
+		       int flags)
 {
 	event->hw.state = 0;
 }
 
-static void lwfp_stop(struct perf_event *event, int flags)
+static void lwfp_stop(struct perf_event *event,
+		      int flags)
 {
 	event->hw.state = PERF_HES_STOPPED;
 }
@@ -1195,9 +1690,31 @@ static struct pmu perf_lwfp = {
 	.event_destroy = lwfp_event_destroy,
 };
 
+#if defined(CONFIG_KVM)
+
+static void lwfp_restore_kvm_exception_nmi(void)
+{
+	void *current_handler;
+
+	current_handler = kvm_switch_handle_exception_nmi(
+		kvm_original_handle_exception_nmi);
+
+	WARN_ON_ONCE(current_handler !=
+		     (void *)lwfp_handle_kvm_exception_nmi);
+
+	atomic_long_set(&kvm_handle_exception_nmi,
+			(long)lwfp_default_kvm_handle_exception_nmi);
+}
+
+#endif /* CONFIG_KVM */
+
 int __init init_lwfp(void)
 {
 	int ret;
+
+#if defined(CONFIG_KVM)
+	void *old_handler;
+#endif
 
 	hash_init(lwfp_module);
 	spin_lock_init(&lwfp_module_lock);
@@ -1211,7 +1728,37 @@ int __init init_lwfp(void)
 	if (ret)
 		return ret;
 
-	return register_die_notifier(&lwfp_exceptions_nb);
+#if defined(CONFIG_KVM)
+	old_handler = kvm_switch_handle_exception_nmi(
+		(void *)lwfp_handle_kvm_exception_nmi);
+
+	kvm_original_handle_exception_nmi = old_handler;
+
+	if (old_handler)
+		atomic_long_set(&kvm_handle_exception_nmi,
+				(long)old_handler);
+#endif
+
+	ret = register_die_notifier(&lwfp_exceptions_nb);
+	if (ret) {
+#if defined(CONFIG_KVM)
+		lwfp_restore_kvm_exception_nmi();
+#endif
+		perf_pmu_unregister(&perf_lwfp);
+	}
+
+	return ret;
+}
+
+void __exit exit_lwfp(void)
+{
+	unregister_die_notifier(&lwfp_exceptions_nb);
+
+#if defined(CONFIG_KVM)
+	lwfp_restore_kvm_exception_nmi();
+#endif
+
+	perf_pmu_unregister(&perf_lwfp);
 }
 
 void unregister_lwfp(struct perf_event *event)

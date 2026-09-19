@@ -56,6 +56,19 @@ enum arm64_reg_idx {
 #define MAX_REGISTER_MATCH_COUNT 32 /* Architecture-agnostic maximum fallback */
 #endif
 
+#define LWFP_FLAG_IP_INC		(1ULL << 0)
+#define LWFP_FLAG_SINGLE_STEP	(1ULL << 1)
+#define LWFP_FLAG_GSREG 		(1ULL << 2)
+#define LWFP_FLAG_FSREG   		(1ULL << 3)
+
+struct perf_sgx_attr {
+	__u64 enclave_base;
+	__u64 ssa_size;
+	__u32 tcs_count;
+	__u32 reserved;
+	__u64 tcs_bases[64];
+};
+
 enum lwfp_type {
 	LWFP_TYPE_NORMAL   = 0,
 	LWFP_TYPE_ENCLAVE  = 1, /*match only RIP && RBX*/
@@ -71,4 +84,6 @@ struct perf_lwfp_attr {
 	uint64_t match;
 	uint64_t regs[MAX_REGISTER_MATCH_COUNT];
 };
+
+
 #endif /* _UAPI_LINUX_LWFP_H */
