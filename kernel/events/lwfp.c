@@ -69,6 +69,7 @@ static const int arch_reg_offsets[MAX_REGISTER_MATCH_COUNT] = {
 	[X86_REG_R14] = offsetof(struct pt_regs, r14),
 	[X86_REG_R15] = offsetof(struct pt_regs, r15),
 };
+
 #elif defined(__aarch64__)
 static const int arch_reg_offsets[MAX_REGISTER_MATCH_COUNT] = {
 	[ARM64_REG_X0]  = offsetof(struct pt_regs, regs[0]),
@@ -104,7 +105,21 @@ static const int arch_reg_offsets[MAX_REGISTER_MATCH_COUNT] = {
 	[ARM64_REG_X30] = offsetof(struct pt_regs, regs[30]),
 	[ARM64_REG_SP]  = offsetof(struct pt_regs, sp),
 };
-#endif
+
+struct tcs {
+	u64 reserved0;
+	u64 flags;
+	u64 ossa;
+	u32 cssa;
+	u32 nssa;
+	u64 oentry;
+	u64 reserved1;
+	u64 ofs_base;
+	u64 ogs_base;
+	u32 ofs_limit;
+	u32 ogs_limit;
+//	u8  reserved[4024];
+};
 
 /*
  * SGX GPRSGX layout (Intel SDM, SSA GPRSGX area). 184 bytes.
@@ -157,7 +172,6 @@ struct lwfp {
 
 	/* SGX-specific storage: kernel-owned copy of user data. */
 	struct perf_sgx_attr *sgx_attr;
-	size_t sgx_attr_size;
 
 	struct list_head node;
 	struct rcu_head rcu;
@@ -199,7 +213,7 @@ struct lwfp_context {
 
 struct lwfp_sgx_match_state {
 	gprs_t gprs;
-	u64 gprsgx_addr;
+	u64 gprs_sgx_addr;
 	bool gprs_valid;
 	struct pt_regs regs;
 };
@@ -410,7 +424,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
  *   - fully contained within a single VMA belonging to task->mm
  *
  * This must be called before any read/write into enclave memory,
- * since gprsgx_addr is derived from user-controlled enclave_base,
+ * since gprs_sgx_addr is derived from user-controlled enclave_base,
  * ssa_framesize, and TCS values.
  */
 static int lwfp_sgx_validate_user_range(struct task_struct *task,
@@ -424,12 +438,6 @@ static int lwfp_sgx_validate_user_range(struct task_struct *task,
 	if (!task || !task->mm || !len)
 		return -EINVAL;
 
-	if (addr + len < addr)
-		return -EOVERFLOW;
-
-	if (!access_ok((void __user *)addr, len))
-		return -EFAULT;
-
 	mm = task->mm;
 
 	mmap_read_lock(mm);
@@ -439,15 +447,6 @@ static int lwfp_sgx_validate_user_range(struct task_struct *task,
 		goto out_unlock;
 
 	if (addr + len > vma->vm_end)
-		goto out_unlock;
-
-	/*
-	 * The enclave mapping must not be writable/executable from the
-	 * kernel's point of view in ways that indicate it isn't the
-	 * expected SGX enclave VMA. At minimum, require that it is a
-	 * valid, non-special mapping.
-	 */
-	if (vma->vm_flags & VM_SPECIAL)
 		goto out_unlock;
 
 	ret = 0;
@@ -464,33 +463,30 @@ out_unlock:
  * task's enclave VMA before returning it.
  */
 static void *
-lwfp_sgx_get_gprsgx_addr(struct task_struct *task,
-			 u64 enclave_base,
-			 u64 tcs_addr,
+lwfp_sgx_get_gprs_sgx_addr(struct task_struct *task, u64 enclave_base, u64 tcs_addr,
 			 u32 ssa_framesize)
 {
-	u64 gprsgx_addr;
+	u64 gprs_sgx_addr;
+	struct tcs tcs;
 	int ret;
 
-	if (!task || !enclave_base || !tcs_addr || !ssa_framesize)
+	if (!task || !tcs_addr || !ssa_framesize)
 		return NULL;
 
-	/*
-	 * The exact SSA/GPRSGX offset calculation depends on the SGX
-	 * layout used by this driver's enclave loader (SSA frame index,
-	 * XSAVE area size, etc). ssa_framesize here represents the fixed
-	 * per-SSA-frame size preceding the GPRSGX region.
-	 */
-	if (check_add_overflow(tcs_addr, (u64)ssa_framesize, &gprsgx_addr))
+	ret = lwfp_sgx_access_enclave(
+			task, tcs_addr,
+			&tcs, 40,/*only obtain till oentry*/
+			false);
+	if (ret != 40)
 		return NULL;
 
-	ret = lwfp_sgx_validate_user_range(task,
-					   (unsigned long)gprsgx_addr,
-					   sizeof(gprs_t));
-	if (ret)
+	if (tcs.cssa == 0)
 		return NULL;
 
-	return (void *)(unsigned long)gprsgx_addr;
+	gprs_sgx_addr = enclave_base + tcs.ossa + ((u64)ssa_framesize * (tcs.cssa + 1));
+	gprs_sgx_addr = gprs_sgx_addr - sizeof(gprs_t);
+
+	return (void *)(unsigned long)gprs_sgx_addr;
 }
 
 /*
@@ -527,13 +523,13 @@ static int lwfp_sgx_access_enclave(struct task_struct *task,
 
 static int lwfp_sgx_handle_flags(struct lwfp *lwfp,
 				 struct task_struct *task,
-				 u64 gprsgx_addr,
+				 u64 gprs_sgx_addr,
 				 struct pt_regs *regs)
 {
 	u64 value;
 	int ret;
 
-	if (!lwfp || !lwfp->attr || !task || !gprsgx_addr || !regs)
+	if (!lwfp || !lwfp->attr || !task || !gprs_sgx_addr || !regs)
 		return -EINVAL;
 
 	if (lwfp->attr->flags & LWFP_FLAG_IP_INC) {
@@ -541,7 +537,7 @@ static int lwfp_sgx_handle_flags(struct lwfp *lwfp,
 
 		ret = lwfp_sgx_access_enclave(
 			task,
-			gprsgx_addr + SGX_GPRSGX_RIP_OFFSET,
+			gprs_sgx_addr + SGX_GPRSGX_RIP_OFFSET,
 			&value,
 			sizeof(value),
 			true);
@@ -556,7 +552,7 @@ static int lwfp_sgx_handle_flags(struct lwfp *lwfp,
 
 		ret = lwfp_sgx_access_enclave(
 			task,
-			gprsgx_addr + SGX_GPRSGX_RFLAGS_OFFSET,
+			gprs_sgx_addr + SGX_GPRSGX_RFLAGS_OFFSET,
 			&value,
 			sizeof(value),
 			true);
@@ -574,7 +570,7 @@ lwfp_handle_flags(struct lwfp *lwfp,
 		  struct pt_regs *regs,
 		  struct kvm_vcpu *vcpu,
 		  struct task_struct *task,
-		  u64 gprsgx_addr)
+		  u64 gprs_sgx_addr)
 {
 	if (!lwfp || !lwfp->attr || !lwfp->attr->flags)
 		return 0;
@@ -587,7 +583,7 @@ lwfp_handle_flags(struct lwfp *lwfp,
 		return lwfp_kvm_handle_flags(lwfp, vcpu, regs);
 
 	case LWFP_TYPE_SGX:
-		return lwfp_sgx_handle_flags(lwfp, task, gprsgx_addr, regs);
+		return lwfp_sgx_handle_flags(lwfp, task, gprs_sgx_addr, regs);
 
 	default:
 		return 0;
@@ -643,7 +639,7 @@ static int execute_event(struct lwfp *target,
 		perf_bp_event(target->event, &sgx_state->regs);
 		return lwfp_sgx_handle_flags(target,
 					     current,
-					     sgx_state->gprsgx_addr,
+					     sgx_state->gprs_sgx_addr,
 					     &sgx_state->regs);
 
 	case LWFP_TYPE_VM:
@@ -879,13 +875,12 @@ add_new_process(pid_t pid)
  * Validate the SGX attribute structure referenced by
  * attr->context1.
  */
-static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr,
-				  size_t *sgx_size)
+static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr)
 {
 	struct perf_sgx_attr header;
 	void __user *user_sgx;
 
-	if (!attr || !attr->context1 || !sgx_size)
+	if (!attr || !attr->context1)
 		return -EINVAL;
 
 	user_sgx = u64_to_user_ptr(attr->context1);
@@ -898,8 +893,6 @@ static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr,
 
 	if (header.tcs_count > ARRAY_SIZE(header.tcs_bases))
 		return -EINVAL;
-
-	*sgx_size = sizeof(header);
 
 	return 0;
 }
@@ -919,7 +912,6 @@ handle_sgx_lwfp(const struct perf_event_attr *event_attr)
 	struct lwfp *lwfp;
 	void __user *user_attr;
 	void __user *user_sgx;
-	size_t sgx_size;
 	int ret;
 
 	if (!event_attr || !event_attr->config2)
@@ -938,24 +930,24 @@ handle_sgx_lwfp(const struct perf_event_attr *event_attr)
 		goto err_attr;
 	}
 
-	ret = validate_sgx_lwfp_attr(lwfp_attr, &sgx_size);
+	ret = validate_sgx_lwfp_attr(lwfp_attr);
 	if (ret)
 		goto err_attr;
 
 	user_sgx = u64_to_user_ptr(lwfp_attr->context1);
 
-	sgx_attr = kmalloc(sgx_size, GFP_KERNEL);
+	sgx_attr = kzalloc(sizeof(struct perf_sgx_attr), GFP_KERNEL);
 	if (!sgx_attr) {
 		ret = -ENOMEM;
 		goto err_attr;
 	}
 
-	if (copy_from_user(sgx_attr, user_sgx, sgx_size)) {
+	if (copy_from_user(sgx_attr, user_sgx, sizeof(struct perf_sgx_attr))) {
 		ret = -EFAULT;
 		goto err_sgx;
 	}
 
-	lwfp = kzalloc(sizeof(*lwfp), GFP_KERNEL);
+	lwfp = kzalloc(sizeof(struct perf_lwfp_attr), GFP_KERNEL);
 	if (!lwfp) {
 		ret = -ENOMEM;
 		goto err_sgx;
@@ -963,7 +955,6 @@ handle_sgx_lwfp(const struct perf_event_attr *event_attr)
 
 	lwfp->attr = lwfp_attr;
 	lwfp->sgx_attr = sgx_attr;
-	lwfp->sgx_attr_size = sgx_size;
 
 	return lwfp;
 
@@ -976,8 +967,7 @@ err_attr:
 }
 
 static struct lwfp *
-add_new_lwfp(struct perf_event *event,
-	     struct thread_node *target)
+add_new_lwfp(struct perf_event *event, struct thread_node *target)
 {
 	struct lwfp *lwfp;
 	unsigned long count;
@@ -1133,7 +1123,7 @@ lwfp_match_sgx(struct lwfp *lwfp,
 	if (!state->gprs_valid) {
 		void *addr;
 
-		addr = lwfp_sgx_get_gprsgx_addr(
+		addr = lwfp_sgx_get_gprs_sgx_addr(
 			task,
 			lwfp->sgx_attr->enclave_base,
 			tcs_addr,
@@ -1141,7 +1131,7 @@ lwfp_match_sgx(struct lwfp *lwfp,
 		if (!addr)
 			return -EFAULT;
 
-		state->gprsgx_addr = (u64)(unsigned long)addr;
+		state->gprs_sgx_addr = (u64)(unsigned long)addr;
 		/*lets compare the rip first*/
 		rip_addr = ((u64)addr) + offsetof(struct gprs, rip);
 
@@ -1159,7 +1149,7 @@ lwfp_match_sgx(struct lwfp *lwfp,
 
 		ret = lwfp_sgx_access_enclave(
 			task,
-			(unsigned long)state->gprsgx_addr,
+			(unsigned long)state->gprs_sgx_addr,
 			&state->gprs,
 			sizeof(state->gprs),
 			false);
