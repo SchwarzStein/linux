@@ -67,7 +67,7 @@ extern int init_lwfp(void);
 
 struct perf_sgx_attr {
 	__u64 enclave_base;
-	__u64 ssa_size;
+	__u64 ssa_framesize;
 	__u32 tcs_count;
 	__u32 reserved;
 	__u64 tcs_bases[64];

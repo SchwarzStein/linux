@@ -831,7 +831,7 @@ static int remove_process(pid_t pid)
 	return removed;
 }
 
-/*TODO: This is unused*/
+/*TODO: This is unused
 static struct thread_node *
 add_new_thread(struct process_node *node, pid_t tid)
 {
@@ -853,7 +853,7 @@ add_new_thread(struct process_node *node, pid_t tid)
 	return new_thread;
 }
 
-/*TODO: This is unused*/
+TODO: This is unused
 static struct process_node *
 add_new_process(pid_t pid)
 {
@@ -874,7 +874,7 @@ add_new_process(pid_t pid)
 
 	return new_node;
 }
-
+*/
 /*
  * Validate the SGX attribute structure referenced by
  * attr->context1.
@@ -884,7 +884,6 @@ static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr,
 {
 	struct perf_sgx_attr header;
 	void __user *user_sgx;
-	size_t tcs_bytes;
 
 	if (!attr || !attr->context1 || !sgx_size)
 		return -EINVAL;
@@ -1111,7 +1110,7 @@ lwfp_match_sgx(struct lwfp *lwfp,
 	       struct lwfp_sgx_match_state *state)
 {
 	u64 tcs_addr;
-	u64 sgx_ip;
+	u64 rip_addr;
 	size_t i;
 	int ret;
 
@@ -1144,12 +1143,12 @@ lwfp_match_sgx(struct lwfp *lwfp,
 
 		state->gprsgx_addr = (u64)(unsigned long)addr;
 		/*lets compare the rip first*/
-		u64 rip_addr = ((u64)addr) + offset(struct gprs, rip);
+		rip_addr = ((u64)addr) + offsetof(struct gprs, rip);
 
 		ret = lwfp_sgx_access_enclave(
 				task,
 				rip_addr,
-				&start->gprs.rip,
+				&state->gprs.rip,
 				sizeof(u64),
 				false);
 		if (ret)
