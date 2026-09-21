@@ -105,6 +105,7 @@ static const int arch_reg_offsets[MAX_REGISTER_MATCH_COUNT] = {
 	[ARM64_REG_X30] = offsetof(struct pt_regs, regs[30]),
 	[ARM64_REG_SP]  = offsetof(struct pt_regs, sp),
 };
+#endif
 
 struct tcs {
 	u64 reserved0;
