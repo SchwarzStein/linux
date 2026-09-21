@@ -459,38 +459,6 @@ out_unlock:
 }
 
 /*
- * Compute the GPRSGX address for a given TCS within the enclave,
- * validating that the resulting address range lies within the
- * task's enclave VMA before returning it.
- */
-static void *
-lwfp_sgx_get_gprs_sgx_addr(struct task_struct *task, u64 enclave_base, u64 tcs_addr,
-			 u32 ssa_framesize)
-{
-	u64 gprs_sgx_addr;
-	struct tcs tcs;
-	int ret;
-
-	if (!task || !tcs_addr || !ssa_framesize)
-		return NULL;
-
-	ret = lwfp_sgx_access_enclave(
-			task, tcs_addr,
-			&tcs, 40,/*only obtain till oentry*/
-			false);
-	if (ret != 40)
-		return NULL;
-
-	if (tcs.cssa == 0)
-		return NULL;
-
-	gprs_sgx_addr = enclave_base + tcs.ossa + ((u64)ssa_framesize * (tcs.cssa + 1));
-	gprs_sgx_addr = gprs_sgx_addr - sizeof(gprs_t);
-
-	return (void *)(unsigned long)gprs_sgx_addr;
-}
-
-/*
  * Read or write the GPRSGX area for a remote task, after validating
  * that [addr, addr + len) is a userspace range fully contained in
  * the task's mm.
@@ -520,6 +488,38 @@ static int lwfp_sgx_access_enclave(struct task_struct *task,
 		return -EFAULT;
 
 	return 0;
+}
+
+/*
+ * Compute the GPRSGX address for a given TCS within the enclave,
+ * validating that the resulting address range lies within the
+ * task's enclave VMA before returning it.
+ */
+static void *
+lwfp_sgx_get_gprs_sgx_addr(struct task_struct *task, u64 enclave_base, u64 tcs_addr,
+			 u32 ssa_framesize)
+{
+	u64 gprs_sgx_addr;
+	struct tcs tcs;
+	int ret;
+
+	if (!task || !tcs_addr || !ssa_framesize)
+		return NULL;
+
+	ret = lwfp_sgx_access_enclave(
+			task, tcs_addr,
+			&tcs, 40,/*only obtain till oentry*/
+			false);
+	if (ret != 40)
+		return NULL;
+
+	if (tcs.cssa == 0)
+		return NULL;
+
+	gprs_sgx_addr = enclave_base + tcs.ossa + ((u64)ssa_framesize * (tcs.cssa + 1));
+	gprs_sgx_addr = gprs_sgx_addr - sizeof(gprs_t);
+
+	return (void *)(unsigned long)gprs_sgx_addr;
 }
 
 static int lwfp_sgx_handle_flags(struct lwfp *lwfp,
