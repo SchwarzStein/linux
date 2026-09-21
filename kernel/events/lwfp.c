@@ -411,7 +411,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
  *
  * This must be called before any read/write into enclave memory,
  * since gprsgx_addr is derived from user-controlled enclave_base,
- * ssa_size, and TCS values.
+ * ssa_framesize, and TCS values.
  */
 static int lwfp_sgx_validate_user_range(struct task_struct *task,
 					unsigned long addr,
@@ -467,21 +467,21 @@ static void *
 lwfp_sgx_get_gprsgx_addr(struct task_struct *task,
 			 u64 enclave_base,
 			 u64 tcs_addr,
-			 u32 ssa_size)
+			 u32 ssa_framesize)
 {
 	u64 gprsgx_addr;
 	int ret;
 
-	if (!task || !enclave_base || !tcs_addr || !ssa_size)
+	if (!task || !enclave_base || !tcs_addr || !ssa_framesize)
 		return NULL;
 
 	/*
 	 * The exact SSA/GPRSGX offset calculation depends on the SGX
 	 * layout used by this driver's enclave loader (SSA frame index,
-	 * XSAVE area size, etc). ssa_size here represents the fixed
+	 * XSAVE area size, etc). ssa_framesize here represents the fixed
 	 * per-SSA-frame size preceding the GPRSGX region.
 	 */
-	if (check_add_overflow(tcs_addr, (u64)ssa_size, &gprsgx_addr))
+	if (check_add_overflow(tcs_addr, (u64)ssa_framesize, &gprsgx_addr))
 		return NULL;
 
 	ret = lwfp_sgx_validate_user_range(task,
@@ -877,9 +877,7 @@ add_new_process(pid_t pid)
 
 /*
  * Validate the SGX attribute structure referenced by
- * attr->context1. Copies only the fixed-size header first, then
- * computes and returns the total size (header + tcs_bases[]) needed
- * to copy the complete structure.
+ * attr->context1.
  */
 static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr,
 				  size_t *sgx_size)
@@ -896,18 +894,13 @@ static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr,
 	if (copy_from_user(&header, user_sgx, sizeof(header)))
 		return -EFAULT;
 
-	if (!header.ssa_size || !header.tcs_count)
+	if (!header.ssa_framesize || !header.tcs_count)
 		return -EINVAL;
 
 	if (header.tcs_count > ARRAY_SIZE(header.tcs_bases))
 		return -EINVAL;
 
-	if (header.tcs_count >
-	    (SIZE_MAX - sizeof(header)) / sizeof(header.tcs_bases[0]))
-		return -EOVERFLOW;
-
-	tcs_bytes = header.tcs_count * sizeof(header.tcs_bases[0]);
-	*sgx_size = sizeof(header) + tcs_bytes;
+	*sgx_size = sizeof(header);
 
 	return 0;
 }
@@ -1118,6 +1111,7 @@ lwfp_match_sgx(struct lwfp *lwfp,
 	       struct lwfp_sgx_match_state *state)
 {
 	u64 tcs_addr;
+	u64 sgx_ip;
 	size_t i;
 	int ret;
 
@@ -1144,11 +1138,25 @@ lwfp_match_sgx(struct lwfp *lwfp,
 			task,
 			lwfp->sgx_attr->enclave_base,
 			tcs_addr,
-			lwfp->sgx_attr->ssa_size);
+			lwfp->sgx_attr->ssa_framesize);
 		if (!addr)
 			return -EFAULT;
 
 		state->gprsgx_addr = (u64)(unsigned long)addr;
+		/*lets compare the rip first*/
+		u64 rip_addr = ((u64)addr) + offset(struct gprs, rip);
+
+		ret = lwfp_sgx_access_enclave(
+				task,
+				rip_addr,
+				&start->gprs.rip,
+				sizeof(u64),
+				false);
+		if (ret)
+			return ret;
+		if (state->regs.ip != lwfp->attr->context0)
+			return 0;
+		/*end*/
 
 		ret = lwfp_sgx_access_enclave(
 			task,
@@ -1160,6 +1168,9 @@ lwfp_match_sgx(struct lwfp *lwfp,
 			return ret;
 
 		state->gprs_valid = true;
+	} else {//state is valid, check RIP and short cut
+		if (state->regs.ip != lwfp->attr->context0)
+			return 0;
 	}
 
 	memset(&state->regs, 0, sizeof(state->regs));

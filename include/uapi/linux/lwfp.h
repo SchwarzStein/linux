@@ -8,7 +8,7 @@
 #define PERF_LWFP_MATCH_FLAGS     BIT(3)
 #define PERF_LWFP_MATCH_ENCLAVE   BIT(4)
 
-#define LWFP_X86_64_REG_MAX 16
+#define LWFP_X86_64_REG_MAX 18
 #define LWFP_ARM64_REG_MAX  32
 
 #if defined(__x86_64__)
@@ -31,6 +31,8 @@ enum x86_64_reg_idx {
 	X86_REG_R13,
 	X86_REG_R14,
 	X86_REG_R15,
+	X86_REG_RIP,
+	X86_REG_RFLAGS,
 };
 
 #elif defined(__aarch64__)
