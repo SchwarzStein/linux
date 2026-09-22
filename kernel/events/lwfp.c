@@ -1013,6 +1013,7 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 	spin_lock(&target->lwfp_lock);
 	list_add_rcu(&lwfp->node, &target->lwfp_list);
 	spin_unlock(&target->lwfp_lock);
+	trace_printk("created a new lwfp of type %d\n", event->attr.bp_type);
 
 	return lwfp;
 
@@ -1217,6 +1218,8 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	pid = task_tgid_nr(current);
 	tid = task_pid_nr(current);
 
+	trace_printk("KVM_EXIT_DEBUG pid: %d tid: %d\n", pid, tid);
+
 	proc_item = lwfp_get_process_node(pid);
 	if (!proc_item)
 		return orig_ret;
@@ -1256,6 +1259,7 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	if (!found)
 		return orig_ret;
 
+	trace_printk("Handling KVM_EXIT_DEBUG with perf_bp_event\n");
 	perf_bp_event(lwfp->event, regs);
 	ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
 
@@ -1451,6 +1455,7 @@ search_for_event(pid_t pid,
 
 	if (found > 0 && !refcount_inc_not_zero(&lwfp->refs))
 		found = 0;
+	trace_printk("found an lwfp of type %d\n", lwfp->type);
 
 	rcu_read_unlock();
 
@@ -1536,6 +1541,9 @@ static int lwfp_event_init(struct perf_event *event)
 	pid_t pid;
 	pid_t tid;
 	int ret = -ENOMEM;
+
+	if (event->attr.type != PERF_TYPE_LWFP)
+		return -ENOENT;
 
 	if ((event->attr.bp_type == LWFP_TYPE_VM ||
 	     event->attr.bp_type == LWFP_TYPE_SGX ||
