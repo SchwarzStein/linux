@@ -68,8 +68,6 @@ static const int arch_reg_offsets[MAX_REGISTER_MATCH_COUNT] = {
 	[X86_REG_R13] = offsetof(struct pt_regs, r13),
 	[X86_REG_R14] = offsetof(struct pt_regs, r14),
 	[X86_REG_R15] = offsetof(struct pt_regs, r15),
-	[X86_REG_RIP] = offsetof(struct pt_regs, ip),
-	[X86_REG_RFLAGS] = offsetof(struct pt_regs, flags),
 };
 
 #elif defined(__aarch64__)

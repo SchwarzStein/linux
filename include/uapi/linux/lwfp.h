@@ -31,8 +31,6 @@ enum x86_64_reg_idx {
 	X86_REG_R13,
 	X86_REG_R14,
 	X86_REG_R15,
-	X86_REG_RIP,
-	X86_REG_RFLAGS,
 };
 
 #elif defined(__aarch64__)
