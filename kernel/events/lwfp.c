@@ -1009,6 +1009,7 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 	lwfp->o_pid = task_tgid_nr(current);
 	lwfp->t_pid = task_tgid_nr(event->hw.target);
 	lwfp->t_tid = task_pid_nr(event->hw.target);
+	lwfp->event = event;
 	lwfp->removed = false;
 	refcount_set(&lwfp->refs, 1);
 
@@ -1268,9 +1269,10 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	}
 
 	trace_printk("KVM: handling KVM_EXIT_DEBUG with perf_bp_event\n");
-	preempt_disable();
+	unsigned long flags;
+	local_irq_save(flags);
 	perf_bp_event(lwfp->event, regs);
-	preempt_enable();
+	local_irq_restore(flags);
 	trace_printk("KVM: done with perf_bp_event\n");
 	ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
 	trace_printk("KVM: done handling flags\n");
