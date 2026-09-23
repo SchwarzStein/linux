@@ -331,7 +331,7 @@ lwfp_match_regs_attr(const struct perf_lwfp_attr *attr,
 
 	match_bitmap = (unsigned long)attr->match;
 	if (!match_bitmap)
-		return 0;
+		return 1;//full match
 
 	for_each_set_bit(bit_index, &match_bitmap,
 			 MAX_REGISTER_MATCH_COUNT) {
@@ -1232,7 +1232,7 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 		process_node_put(proc_item);
 		return orig_ret;
 	}
-	trace_printk("vcpu ip is 0x%lx", instruction_pointer(regs));
+	trace_printk("vcpu ip is 0x%lx\n", instruction_pointer(regs));
 
 	rcu_read_lock();
 
