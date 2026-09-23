@@ -401,6 +401,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 		instruction_pointer_set(regs, ip);
 
 #if defined(CONFIG_X86_64)
+		trace_printk("KVM:update vcpu ip\n");
 		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
 		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
 		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
@@ -409,6 +410,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 #else
 		return -EOPNOTSUPP;
 #endif
+		trace_printk("KVM:done update vcpu ip\n");
 	}
 
 	if (flags & LWFP_FLAG_SINGLE_STEP) {
@@ -1265,13 +1267,15 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 		return orig_ret;
 	}
 
-	trace_printk("Handling KVM_EXIT_DEBUG with perf_bp_event\n");
+	trace_printk("KVM: handling KVM_EXIT_DEBUG with perf_bp_event\n");
 	perf_bp_event(lwfp->event, regs);
+	trace_printk("KVM: done with perf_bp_event\n");
 	ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
+	trace_printk("KVM: done handling flags\n");
 
 	lwfp_put(lwfp);
-
-	return ret ? ret : 1;
+	(void)ret;
+	return 0;
 }
 
 #endif /* CONFIG_KVM */
