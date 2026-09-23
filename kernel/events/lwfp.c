@@ -1013,7 +1013,7 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 	spin_lock(&target->lwfp_lock);
 	list_add_rcu(&lwfp->node, &target->lwfp_list);
 	spin_unlock(&target->lwfp_lock);
-	trace_printk("created a new lwfp of type %d\n", event->attr.bp_type);
+	trace_printk("created a new lwfp of type %d pid: %d tid: %d\n", event->attr.bp_type, lwfp->t_pid, lwfp->t_tid);
 
 	return lwfp;
 
