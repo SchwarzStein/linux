@@ -390,6 +390,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 {
 	u64 flags;
 	unsigned long ip;
+	struct kvm_regs kvm_regs; 
 
 	if (!lwfp || !lwfp->attr || !vcpu || !regs)
 		return -EINVAL;
@@ -402,13 +403,20 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 
 #if defined(CONFIG_X86_64)
 		trace_printk("KVM:update vcpu ip 0x%lx\n", ip);
-		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
-		vcpu->run->debug.arch.pc = kvm_get_linear_rip(vcpu);
+//		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
+//		vcpu->run->debug.arch.pc = kvm_get_linear_rip(vcpu);
+//		vcpu->run->debug.arch.exception = 0;
+//		vcpu->run->ex.exception = 0;
+//		vcpu->run->ex.error_code = 0;
+//		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
+//		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
+
+		kvm_arch_vcpu_ioctl_get_regs(vcpu, &kvm_regs);
+		kvm_regs.rip++;
+		kvm_arch_vcpu_ioctl_set_regs(vcpu, &kvm_regs);
 		vcpu->run->debug.arch.exception = 0;
 		vcpu->run->ex.exception = 0;
 		vcpu->run->ex.error_code = 0;
-		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
-		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
 #elif defined(CONFIG_ARM64)
 		kvm_set_vcpu_ip(vcpu, ip);
 #else
