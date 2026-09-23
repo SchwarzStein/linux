@@ -401,7 +401,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 		instruction_pointer_set(regs, ip);
 
 #if defined(CONFIG_X86_64)
-		trace_printk("KVM:update vcpu ip\n");
+		trace_printk("KVM:update vcpu ip 0x%lx\n", ip);
 		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
 		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
 		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
@@ -1279,7 +1279,7 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 
 	lwfp_put(lwfp);
 	(void)ret;
-	return 0;
+	return 1;
 }
 
 #endif /* CONFIG_KVM */
