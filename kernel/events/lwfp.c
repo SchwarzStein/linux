@@ -1556,7 +1556,7 @@ static int lwfp_event_init(struct perf_event *event)
 	    event->attr.config2 == 0)
 		return -EINVAL;
 
-	pid = task_tgid_nr(current);
+	pid = task_tgid_nr(event->hw.target);
 	tid = task_pid_nr(event->hw.target);
 
 	spin_lock(&lwfp_module_lock);
