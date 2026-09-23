@@ -1221,11 +1221,14 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	trace_printk("KVM_EXIT_DEBUG pid: %d tid: %d\n", pid, tid);
 
 	proc_item = lwfp_get_process_node(pid);
-	if (!proc_item)
+	if (!proc_item) {
+		trace_printk("process item not found\n");
 		return orig_ret;
+	}
 
 	thread_item = lwfp_get_thread_node(proc_item, tid);
 	if (!thread_item) {
+		trace_printk("thread item not found\n");
 		process_node_put(proc_item);
 		return orig_ret;
 	}
@@ -1256,8 +1259,10 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	thread_node_put(thread_item);
 	process_node_put(proc_item);
 
-	if (!found)
+	if (!found){
+		trace_printk("no matching probe found\n");
 		return orig_ret;
+	}
 
 	trace_printk("Handling KVM_EXIT_DEBUG with perf_bp_event\n");
 	perf_bp_event(lwfp->event, regs);
