@@ -1232,6 +1232,7 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 		process_node_put(proc_item);
 		return orig_ret;
 	}
+	trace_printk("vcpu ip is 0x%lx", instruction_pointer(regs));
 
 	rcu_read_lock();
 
@@ -1240,7 +1241,7 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 				 node) {
 		if (lwfp->type != LWFP_TYPE_VM)
 			continue;
-
+		//get the rip from kvm_regs
 		if (instruction_pointer(regs) != lwfp->config1)
 			continue;
 
