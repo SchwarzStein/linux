@@ -1268,7 +1268,9 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	}
 
 	trace_printk("KVM: handling KVM_EXIT_DEBUG with perf_bp_event\n");
+	preempt_disable();
 	perf_bp_event(lwfp->event, regs);
+	preempt_enable();
 	trace_printk("KVM: done with perf_bp_event\n");
 	ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
 	trace_printk("KVM: done handling flags\n");
