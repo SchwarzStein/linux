@@ -45,7 +45,6 @@
 #include <linux/kvm_host.h>
 #include <uapi/linux/lwfp.h>
 #include <linux/perf_event.h>
-#include <kvm/kvm_cache_regs.h>
 
 #define EVENT_HTABLE_WIDTH	16
 #define LWFP_MODULE_WIDTH	4
