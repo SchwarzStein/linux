@@ -405,9 +405,6 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
 		__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
 		__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
-		vcpu->run->debug.arch.exception = 0;
-		vcpu->run->ex.exception = 0;
-		vcpu->run->ex.error_code = 0;
 #elif defined(CONFIG_ARM64)
 		kvm_set_vcpu_ip(vcpu, ip);
 #else
