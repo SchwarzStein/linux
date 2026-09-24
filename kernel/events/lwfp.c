@@ -45,6 +45,7 @@
 #include <linux/kvm_host.h>
 #include <uapi/linux/lwfp.h>
 #include <linux/perf_event.h>
+#include <kvm/kvm_cache_regs.h>
 
 #define EVENT_HTABLE_WIDTH	16
 #define LWFP_MODULE_WIDTH	4
@@ -390,7 +391,6 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 {
 	u64 flags;
 	unsigned long ip;
-	struct kvm_regs kvm_regs; 
 
 	if (!lwfp || !lwfp->attr || !vcpu || !regs)
 		return -EINVAL;
@@ -403,17 +403,9 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 
 #if defined(CONFIG_X86_64)
 		trace_printk("KVM:update vcpu ip 0x%lx\n", ip);
-//		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
-//		vcpu->run->debug.arch.pc = kvm_get_linear_rip(vcpu);
-//		vcpu->run->debug.arch.exception = 0;
-//		vcpu->run->ex.exception = 0;
-//		vcpu->run->ex.error_code = 0;
-//		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
-//		__clear_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
-
-		kvm_arch_vcpu_ioctl_get_regs(vcpu, &kvm_regs);
-		kvm_regs.rip++;
-		kvm_arch_vcpu_ioctl_set_regs(vcpu, &kvm_regs);
+		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
+		__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
+		__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
 		vcpu->run->debug.arch.exception = 0;
 		vcpu->run->ex.exception = 0;
 		vcpu->run->ex.error_code = 0;
