@@ -402,9 +402,10 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 
 #if defined(CONFIG_X86_64)
 		trace_printk("KVM:update vcpu ip 0x%lx\n", ip);
-		vcpu->arch.regs[VCPU_REGS_RIP] = ip;
-		__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
-		__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
+	//	vcpu->arch.regs[VCPU_REGS_RIP] = ip;
+	//	__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
+	//	__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
+		kvm_skip_emulated_instruction(vcpu);
 #elif defined(CONFIG_ARM64)
 		kvm_set_vcpu_ip(vcpu, ip);
 #else
