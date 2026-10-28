@@ -180,6 +180,12 @@ struct lwfp {
 	refcount_t refs;
 };
 
+struct lwfp_saved_attr
+{
+	struct perf_lwfp_attr lwfp_attr;
+	struct perf_sgx_attr  sgx_attr;
+};
+
 struct thread_node {
 	pid_t tid;
 	struct list_head lwfp_list;
@@ -253,7 +259,7 @@ static void *kvm_original_handle_exception_nmi;
 
 #endif /* CONFIG_KVM */
 
-static struct lwfp *search_for_event(pid_t pid, pid_t tid,
+struct lwfp *search_for_event(pid_t pid, pid_t tid,
 				     struct pt_regs *regs,
 				     struct lwfp_sgx_match_state *sgx_state);
 static int execute_event(struct lwfp *target, struct pt_regs *regs,
@@ -401,7 +407,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 		instruction_pointer_set(regs, ip);
 
 #if defined(CONFIG_X86_64)
-		trace_printk("KVM:update vcpu ip 0x%lx\n", ip);
+		//trace_printk("KVM:update vcpu ip 0x%lx\n", ip);
 	//	vcpu->arch.regs[VCPU_REGS_RIP] = ip;
 	//	__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_avail);
 	//	__set_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty);
@@ -411,7 +417,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 #else
 		return -EOPNOTSUPP;
 #endif
-		trace_printk("KVM:done update vcpu ip\n");
+		//trace_printk("KVM:done update vcpu ip\n");
 	}
 
 	if (flags & LWFP_FLAG_SINGLE_STEP) {
@@ -454,6 +460,7 @@ static int lwfp_sgx_validate_user_range(struct task_struct *task,
 		goto out_unlock;
 
 	ret = 0;
+	//trace_printk("sgx validate succeeded\n");
 
 out_unlock:
 	mmap_read_unlock(mm);
@@ -479,18 +486,22 @@ static int lwfp_sgx_access_enclave(struct task_struct *task,
 		return -EINVAL;
 
 	ret = lwfp_sgx_validate_user_range(task, addr, len);
-	if (ret)
+	if (ret < 0) {
+		//trace_printk("failed access enclave: validate user range 0x%lx len %ld\n", addr, len);
 		return ret;
+	}
 
 	access_ret = access_process_vm(task,
 				       addr,
 				       buf,
 				       len,
 				       write ? FOLL_WRITE : 0);
-	if (access_ret != len)
+	if (access_ret != len) {
+		//trace_printk("access enclave error accessing 0x%lx:<%ld>\n",addr,len);
 		return -EFAULT;
+	}
 
-	return 0;
+	return access_ret;
 }
 
 /*
@@ -516,10 +527,11 @@ lwfp_sgx_get_gprs_sgx_addr(struct task_struct *task, u64 enclave_base, u64 tcs_a
 	if (ret != 40)
 		return NULL;
 
-	if (tcs.cssa == 0)
+	if (tcs.cssa == 0 || tcs.ossa == 0)
 		return NULL;
-
-	gprs_sgx_addr = enclave_base + tcs.ossa + ((u64)ssa_framesize * (tcs.cssa + 1));
+	//trace_printk("read tcs succesfully base %llx ossa %llx cssa %d \n", enclave_base, tcs.ossa, tcs.cssa);
+	gprs_sgx_addr = enclave_base + tcs.ossa + ((u64)ssa_framesize * tcs.cssa );
+	//trace_printk("gprs_sgx %llx\n", gprs_sgx_addr);
 	gprs_sgx_addr = gprs_sgx_addr - sizeof(gprs_t);
 
 	return (void *)(unsigned long)gprs_sgx_addr;
@@ -538,16 +550,16 @@ static int lwfp_sgx_handle_flags(struct lwfp *lwfp,
 
 	if (lwfp->attr->flags & LWFP_FLAG_IP_INC) {
 		value = instruction_pointer(regs) + 1;
-
+		//trace_printk("attempting to increment sgx rip 0x%llx\n", value);
 		ret = lwfp_sgx_access_enclave(
 			task,
 			gprs_sgx_addr + SGX_GPRSGX_RIP_OFFSET,
 			&value,
 			sizeof(value),
 			true);
-		if (ret)
+		if (ret < 0)
 			return ret;
-
+		//trace_printk("setting instruction pointer 0x%llx\n", value);
 		instruction_pointer_set(regs, value);
 	}
 
@@ -560,7 +572,7 @@ static int lwfp_sgx_handle_flags(struct lwfp *lwfp,
 			&value,
 			sizeof(value),
 			true);
-		if (ret)
+		if (ret < 0)
 			return ret;
 
 		regs->flags = value;
@@ -577,7 +589,7 @@ lwfp_handle_flags(struct lwfp *lwfp,
 		  u64 gprs_sgx_addr)
 {
 	if (!lwfp || !lwfp->attr || !lwfp->attr->flags)
-		return 0;
+		return -1;
 
 	switch (lwfp->type) {
 	case LWFP_TYPE_EXTENDED:
@@ -623,24 +635,35 @@ static int execute_event(struct lwfp *target,
 			struct pt_regs *regs,
 			struct lwfp_sgx_match_state *sgx_state)
 {
+	int flags;
 
 	if (!target || !target->event || !regs)
-		return 0;
+		return -1;
 
 	switch (target->type) {
 	case LWFP_TYPE_NORMAL:
 	case LWFP_TYPE_ENCLAVE:
+		local_irq_save(flags);
 		perf_bp_event(target->event, regs);
-		return 0;
+		local_irq_restore(flags);
+		return 1;
+
 	case LWFP_TYPE_EXTENDED:
+		local_irq_save(flags);
 		perf_bp_event(target->event, regs);
+		local_irq_restore(flags);
 		return lwfp_handle_flags(target, regs, NULL, NULL, 0);
 
 	case LWFP_TYPE_SGX:
-		if (!sgx_state || !sgx_state->gprs_valid)
+		if (!sgx_state || !sgx_state->gprs_valid) {
+			//trace_printk("SGX: sgx_state or invalid gprs\n");
 			return -EFAULT;
+		}
 
+		//trace_printk("executing SGX\n");
+		local_irq_save(flags);
 		perf_bp_event(target->event, &sgx_state->regs);
+		local_irq_restore(flags);
 		return lwfp_sgx_handle_flags(target,
 					     current,
 					     sgx_state->gprs_sgx_addr,
@@ -653,7 +676,7 @@ static int execute_event(struct lwfp *target,
 		return -EOPNOTSUPP;
 
 	default:
-		return 0;
+		return -1;
 	}
 }
 
@@ -679,13 +702,13 @@ int lwfp_exceptions_notify(struct notifier_block *unused,
 
 	if (!user_mode(regs))
 		return NOTIFY_DONE;
-
 	lwfp = search_for_event(task_tgid_nr(current),
 				task_pid_nr(current),
 				regs,
 				&sgx_state);
-	if (!lwfp)
+	if (!lwfp) {
 		return NOTIFY_DONE;
+	}
 
 	ret = execute_event(lwfp, regs, &sgx_state);
 
@@ -694,7 +717,7 @@ int lwfp_exceptions_notify(struct notifier_block *unused,
 	if (ret < 0)
 		return NOTIFY_DONE;
 
-	return ret ? NOTIFY_STOP : NOTIFY_DONE;
+	return NOTIFY_STOP;
 }
 
 static struct notifier_block lwfp_exceptions_nb = {
@@ -879,24 +902,36 @@ add_new_process(pid_t pid)
  * Validate the SGX attribute structure referenced by
  * attr->context1.
  */
-static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr)
+static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr, struct perf_sgx_attr *header)
 {
-	struct perf_sgx_attr header;
 	void __user *user_sgx;
 
-	if (!attr || !attr->context1)
+	if (!attr || !attr->context1 || !header) {
 		return -EINVAL;
+	}
 
 	user_sgx = u64_to_user_ptr(attr->context1);
 
-	if (copy_from_user(&header, user_sgx, sizeof(header)))
+	if (copy_from_user(header, user_sgx, sizeof(struct perf_sgx_attr))) {
+		//trace_printk("failed to read user address %p\n",user_sgx);
 		return -EFAULT;
+	}
 
-	if (!header.ssa_framesize || !header.tcs_count)
-		return -EINVAL;
+	//trace_printk("user address %p\n",user_sgx);
+	//trace_printk("framesize: 0x%llx\n", header->ssa_framesize);
+	//trace_printk("tcs_count: 0x%llx\n", header->tcs_count);
+	//trace_printk("base_address: 0x%llx\n", header->enclave_base);
 
-	if (header.tcs_count > ARRAY_SIZE(header.tcs_bases))
+	if (!header->ssa_framesize || !header->tcs_count) {
+		//trace_printk("failed ssa and tcs count\n");
 		return -EINVAL;
+	}
+
+	if (header->tcs_count > ARRAY_SIZE(header->tcs_bases)) {
+		//trace_printk("incorrect tcs count\n");
+		return -EINVAL;
+	}
+
 
 	return 0;
 }
@@ -909,7 +944,7 @@ static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr)
  * caller (add_new_lwfp()).
  */
 static struct lwfp *
-handle_sgx_lwfp(const struct perf_event_attr *event_attr)
+handle_new_sgx_lwfp(const struct perf_event_attr *event_attr)
 {
 	struct perf_lwfp_attr *lwfp_attr;
 	struct perf_sgx_attr *sgx_attr;
@@ -918,41 +953,44 @@ handle_sgx_lwfp(const struct perf_event_attr *event_attr)
 	void __user *user_sgx;
 	int ret;
 
-	if (!event_attr || !event_attr->config2)
+	if (!event_attr || !event_attr->config2) {
+		//trace_printk("failed event attr and config2\n");
 		return ERR_PTR(-EINVAL);
+	}
 
 	user_attr = u64_to_user_ptr(event_attr->config2);
 
 	lwfp_attr = kzalloc(sizeof(*lwfp_attr), GFP_KERNEL);
-	if (!lwfp_attr)
+	if (!lwfp_attr) {
+		//trace_printk("1st memalloc\n");
 		return ERR_PTR(-ENOMEM);
+	}
 
 	if (copy_from_user(lwfp_attr,
 			   user_attr,
 			   sizeof(*lwfp_attr))) {
+		//trace_printk("failed copy from user user attr\n");
 		ret = -EFAULT;
 		goto err_attr;
 	}
 
-	ret = validate_sgx_lwfp_attr(lwfp_attr);
-	if (ret)
-		goto err_attr;
-
-	user_sgx = u64_to_user_ptr(lwfp_attr->context1);
-
 	sgx_attr = kzalloc(sizeof(struct perf_sgx_attr), GFP_KERNEL);
 	if (!sgx_attr) {
+		//trace_printk("2nd memalloc\n");
 		ret = -ENOMEM;
 		goto err_attr;
 	}
 
-	if (copy_from_user(sgx_attr, user_sgx, sizeof(struct perf_sgx_attr))) {
-		ret = -EFAULT;
+	ret = validate_sgx_lwfp_attr(lwfp_attr, sgx_attr);
+	if (ret) {
+		//trace_printk("failed to validate sgx attributes\n");
 		goto err_sgx;
 	}
 
-	lwfp = kzalloc(sizeof(struct perf_lwfp_attr), GFP_KERNEL);
+
+	lwfp = kzalloc(sizeof(struct lwfp), GFP_KERNEL);
 	if (!lwfp) {
+		//trace_printk("3rd memalloc\n");
 		ret = -ENOMEM;
 		goto err_sgx;
 	}
@@ -973,34 +1011,124 @@ err_attr:
 static struct lwfp *
 add_new_lwfp(struct perf_event *event, struct thread_node *target)
 {
-	struct lwfp *lwfp;
+	struct lwfp_saved_attr attr = {0};
 	unsigned long count;
+	struct lwfp *lwfp;
+	struct perf_lwfp_attr *lwfp_attr;
+	struct perf_sgx_attr *sgx_attr;
+	void *ret;
+	int needs_copy = 0;
 
-	if (event->attr.bp_type == LWFP_TYPE_SGX) {
-		lwfp = handle_sgx_lwfp(&event->attr);
-		if (IS_ERR(lwfp))
+	if (event->attr.bp_type == LWFP_TYPE_EXTENDED ||
+		event->attr.bp_type == LWFP_TYPE_SGX  ||
+		event->attr.bp_type == LWFP_TYPE_VM )
+	{
+		needs_copy = 1;
+	}
+
+	if ( needs_copy && event->parent && event->parent->pmu_private) {
+
+		if (event->pmu_private != NULL) {
+			//trace_printk("pmu private is not NULL\n");
 			return NULL;
+		}
+
+		ret = memcpy(&attr, event->parent->pmu_private, sizeof(struct lwfp_saved_attr));
+		if (ret != &attr) {
+			//trace_printk("failed attr copy\n");
+			return NULL;
+		}
+
+		lwfp = kzalloc(sizeof(struct lwfp), GFP_KERNEL);
+		if (!lwfp) {
+			//trace_printk("failed lwfp alloc\n");
+			return NULL;
+		}
+
+		lwfp_attr = kzalloc(sizeof(struct perf_lwfp_attr), GFP_KERNEL);
+		if (!lwfp_attr) {
+			//trace_printk("failed lwfp attr\n");
+			goto error_lwfp;
+		}
+
+		ret = memcpy(lwfp_attr, &attr.lwfp_attr, sizeof(struct perf_lwfp_attr));
+		if (ret != lwfp_attr) {
+			//trace_printk("lwfp attr failed copy\n");
+			goto error_lwfp_attr;
+		}
+
+		if (event->attr.bp_type == LWFP_TYPE_SGX) {
+			sgx_attr = kzalloc(sizeof(struct perf_sgx_attr), GFP_KERNEL);
+			if (!sgx_attr) {
+				//trace_printk("failed sgx_attr \n");
+				goto error_lwfp_attr;
+			}
+
+			memcpy(sgx_attr, &attr.sgx_attr, sizeof(struct perf_sgx_attr));
+		}
+
+		event->pmu_private = kzalloc(sizeof(struct lwfp_saved_attr), GFP_KERNEL);
+		if (!event->pmu_private) {
+			//trace_printk("failed alloc pmu private\n");
+			goto error_sgx_attr;
+		}
+
+		memcpy(event->pmu_private, &attr, sizeof(struct lwfp_saved_attr));
+		lwfp->sgx_attr = sgx_attr;
+		lwfp->attr = lwfp_attr;
+
 	} else {
-		lwfp = kzalloc(sizeof(*lwfp), GFP_KERNEL);
-		if (!lwfp)
-			return NULL;
+		if (event->attr.bp_type == LWFP_TYPE_SGX) {
+			//trace_printk("adding LWFP_TYPE_SGX \n");
+			lwfp = handle_new_sgx_lwfp(&event->attr);
+			if (IS_ERR(lwfp)) {
+				//trace_printk("failed handling lwfp attributes 0x%llx\n", lwfp);
+				return NULL;
+			}
+		} else {
+			lwfp = kzalloc(sizeof(*lwfp), GFP_KERNEL);
+			if (!lwfp){
+				//trace_printk("failed 2 lwfp alloc\n");
+				return NULL;
+			}
 
-		if (event->attr.bp_type == LWFP_TYPE_VM ||
-		    event->attr.bp_type == LWFP_TYPE_EXTENDED) {
-			if (!event->attr.config2)
-				goto error_attr_alloc;
+			if (event->attr.bp_type == LWFP_TYPE_VM ||
+			    event->attr.bp_type == LWFP_TYPE_EXTENDED) {
+				if (!event->attr.config2) {
+					//trace_printk("event attr config2\n");
+					goto error_attr_alloc;
+				}
 
-			lwfp->attr = kzalloc(sizeof(*lwfp->attr),
-					     GFP_KERNEL);
-			if (!lwfp->attr)
-				goto error_attr_alloc;
+				lwfp->attr = kzalloc(sizeof(*lwfp->attr),
+						     GFP_KERNEL);
+				if (!lwfp->attr)
+					goto error_attr_alloc;
 
-			count = copy_from_user(
-				lwfp->attr,
-				u64_to_user_ptr(event->attr.config2),
-				sizeof(*lwfp->attr));
-			if (count != 0)
+				count = copy_from_user(
+					lwfp->attr,
+					u64_to_user_ptr(event->attr.config2),
+					sizeof(*lwfp->attr));
+				if (count != 0)
+					goto error_copy;
+			}
+		}
+		if (needs_copy) {
+			if (event->pmu_private != NULL) {
+				//trace_printk("pmu private is not NULL for a new event!\n");
 				goto error_copy;
+			}
+
+			event->pmu_private = kzalloc(sizeof(struct lwfp_saved_attr), GFP_KERNEL);
+			if (!event->pmu_private) 
+				goto error_copy;
+
+			if (lwfp->sgx_attr) {
+				sgx_attr = (struct perf_sgx_attr*) &(((struct lwfp_saved_attr*)event->pmu_private)->sgx_attr);
+				memcpy(sgx_attr, lwfp->sgx_attr, sizeof(struct perf_sgx_attr));
+			}
+
+			lwfp_attr = (struct perf_lwfp_attr*) &(((struct lwfp_saved_attr*)event->pmu_private)->lwfp_attr);
+			memcpy(lwfp_attr, lwfp->attr, sizeof(struct perf_lwfp_attr));
 		}
 	}
 
@@ -1017,7 +1145,7 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 	spin_lock(&target->lwfp_lock);
 	list_add_rcu(&lwfp->node, &target->lwfp_list);
 	spin_unlock(&target->lwfp_lock);
-	trace_printk("created a new lwfp of type %d pid: %d tid: %d\n", event->attr.bp_type, lwfp->t_pid, lwfp->t_tid);
+	//trace_printk("created a new lwfp of type %d pid: %d tid: %d\n", event->attr.bp_type, lwfp->t_pid, lwfp->t_tid);
 
 	return lwfp;
 
@@ -1027,6 +1155,14 @@ error_copy:
 error_attr_alloc:
 	kfree(lwfp);
 
+	return NULL;
+
+error_sgx_attr:
+		kfree(sgx_attr);
+error_lwfp_attr:
+		kfree(lwfp_attr);
+error_lwfp:
+		kfree(lwfp);
 	return NULL;
 }
 
@@ -1118,24 +1254,29 @@ lwfp_match_sgx(struct lwfp *lwfp,
 	if (!tcs_addr)
 		return 0;
 
+	//trace_printk("matching sgx\n");
 	for (i = 0; i < lwfp->sgx_attr->tcs_count; i++) {
 		if (lwfp->sgx_attr->tcs_bases[i] == tcs_addr)
 			break;
 	}
 
-	if (i == lwfp->sgx_attr->tcs_count)
+	if (i == lwfp->sgx_attr->tcs_count) {
+		//trace_printk("sgx item not found\n");
 		return 0;
+	}
 
 	if (!state->gprs_valid) {
 		void *addr;
+		//trace_printk("reading gprs\n");
 
 		addr = lwfp_sgx_get_gprs_sgx_addr(
 			task,
 			lwfp->sgx_attr->enclave_base,
 			tcs_addr,
 			lwfp->sgx_attr->ssa_framesize);
-		if (!addr)
+		if (!addr) {
 			return -EFAULT;
+		}
 
 		state->gprs_sgx_addr = (u64)(unsigned long)addr;
 		/*lets compare the rip first*/
@@ -1147,11 +1288,13 @@ lwfp_match_sgx(struct lwfp *lwfp,
 				&state->gprs.rip,
 				sizeof(u64),
 				false);
-		if (ret)
+
+		if (ret <= 0)
 			return ret;
-		if (state->regs.ip != lwfp->attr->context0)
+		if (state->gprs.rip != lwfp->attr->context0) {
+			//trace_printk("failed ip match current: %llx installed %llx\n",state->gprs.rip, lwfp->attr->context0);
 			return 0;
-		/*end*/
+		}
 
 		ret = lwfp_sgx_access_enclave(
 			task,
@@ -1159,12 +1302,14 @@ lwfp_match_sgx(struct lwfp *lwfp,
 			&state->gprs,
 			sizeof(state->gprs),
 			false);
-		if (ret)
+		if (ret <= 0) {
+			//trace_printk("could not read gprs value\n");
 			return ret;
+		}
 
 		state->gprs_valid = true;
 	} else {//state is valid, check RIP and short cut
-		if (state->regs.ip != lwfp->attr->context0)
+		if (state->gprs.rip != lwfp->attr->context0)
 			return 0;
 	}
 
@@ -1190,6 +1335,7 @@ lwfp_match_sgx(struct lwfp *lwfp,
 
 	state->regs.flags = state->gprs.rflags;
 	state->regs.ip = state->gprs.rip;
+	//trace_printk("enclave ip is %lx\n", state->regs.ip);
 
 	return lwfp_match_regs_attr(lwfp->attr, &state->regs);
 }
@@ -1222,21 +1368,21 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	pid = task_tgid_nr(current);
 	tid = task_pid_nr(current);
 
-	trace_printk("KVM_EXIT_DEBUG pid: %d tid: %d\n", pid, tid);
+	//trace_printk("KVM_EXIT_DEBUG pid: %d tid: %d\n", pid, tid);
 
 	proc_item = lwfp_get_process_node(pid);
 	if (!proc_item) {
-		trace_printk("process item not found\n");
+		//trace_printk("process item not found\n");
 		return orig_ret;
 	}
 
 	thread_item = lwfp_get_thread_node(proc_item, tid);
 	if (!thread_item) {
-		trace_printk("thread item not found\n");
+		//trace_printk("thread item not found\n");
 		process_node_put(proc_item);
 		return orig_ret;
 	}
-	trace_printk("vcpu ip is 0x%lx\n", instruction_pointer(regs));
+	//trace_printk("vcpu ip is 0x%lx\n", instruction_pointer(regs));
 
 	rcu_read_lock();
 
@@ -1265,18 +1411,18 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	process_node_put(proc_item);
 
 	if (!found){
-		trace_printk("no matching probe found\n");
+		//trace_printk("no matching probe found\n");
 		return orig_ret;
 	}
 
-	trace_printk("KVM: handling KVM_EXIT_DEBUG with perf_bp_event\n");
+	//trace_printk("KVM: handling KVM_EXIT_DEBUG with perf_bp_event\n");
 	unsigned long flags;
 	local_irq_save(flags);
 	perf_bp_event(lwfp->event, regs);
 	local_irq_restore(flags);
-	trace_printk("KVM: done with perf_bp_event\n");
+	//trace_printk("KVM: done with perf_bp_event\n");
 	ret = lwfp_kvm_handle_flags(lwfp, vcpu, regs);
-	trace_printk("KVM: done handling flags\n");
+	//trace_printk("KVM: done handling flags\n");
 
 	lwfp_put(lwfp);
 	(void)ret;
@@ -1394,7 +1540,7 @@ int lwfp_handle_kvm_exception_nmi(struct kvm_vcpu *vcpu)
 
 #endif /* CONFIG_KVM */
 
-static struct lwfp *
+struct lwfp *
 search_for_event(pid_t pid,
 		 pid_t tid,
 		 struct pt_regs *regs,
@@ -1409,17 +1555,21 @@ search_for_event(pid_t pid,
 		return NULL;
 
 	proc_item = lwfp_get_process_node(pid);
-	if (!proc_item)
+	if (!proc_item) {
+		//trace_printk("process not found\n");
 		return NULL;
+	}
 
 	thread_item = lwfp_get_thread_node(proc_item, tid);
 	if (!thread_item) {
 		process_node_put(proc_item);
+		//trace_printk("thread not found pid: %d tid %d rip:%p bx: %llx\n", pid, tid, regs->ip, regs->bx);
 		return NULL;
 	}
 
 	rcu_read_lock();
 
+//	//trace_printk("searching for event pid %d:tid %d , ip: %lx\n",pid,tid,regs->ip);
 	list_for_each_entry_rcu(lwfp,
 				&thread_item->lwfp_list,
 				node) {
@@ -1446,6 +1596,9 @@ search_for_event(pid_t pid,
 			break;
 
 		case LWFP_TYPE_SGX:
+//			//trace_printk("lwfp matching type sgx\n");
+			if (instruction_pointer(regs) != lwfp->config1)
+				continue;
 			found = lwfp_match_sgx(lwfp,
 					       current,
 					       regs,
@@ -1470,7 +1623,7 @@ search_for_event(pid_t pid,
 
 	if (found > 0 && !refcount_inc_not_zero(&lwfp->refs))
 		found = 0;
-	trace_printk("found an lwfp of type %d\n", lwfp->type);
+	//trace_printk("found lwfp of type %d\n", lwfp->type);
 
 	rcu_read_unlock();
 
@@ -1540,6 +1693,9 @@ static void lwfp_event_destroy(struct perf_event *event)
 	lwfp_put(lwfp);
 
 	lwfp_event_put(bp_event);
+	if (event->pmu_private) {
+		kfree(event->pmu_private);
+	}
 
 	return;
 }
@@ -1555,8 +1711,9 @@ static int lwfp_event_init(struct perf_event *event)
 	bool thread_created = false;
 	pid_t pid;
 	pid_t tid;
-	int ret = -ENOMEM;
+	int ret = -EINVAL;
 
+	//trace_printk("create new event parent: %p event: %p pmu:%p\n", event->parent, event, event->pmu_private);
 	if (event->attr.type != PERF_TYPE_LWFP)
 		return -ENOENT;
 
@@ -1569,6 +1726,7 @@ static int lwfp_event_init(struct perf_event *event)
 	pid = task_tgid_nr(event->hw.target);
 	tid = task_pid_nr(event->hw.target);
 
+	//trace_printk("create new event for pid %d tid %d config1 %llx config2 %llx\n",pid ,tid, event->attr.config1, event->attr.config2);
 	spin_lock(&lwfp_module_lock);
 
 	hash_for_each_possible(lwfp_module, proc_item, node, pid) {
@@ -1631,8 +1789,12 @@ static int lwfp_event_init(struct perf_event *event)
 		goto process_cleanup;
 
 	lwfp = add_new_lwfp(event, thread);
-	if (!lwfp)
+	if (!lwfp) {
+		//trace_printk("failed to add new lwfp\n");
 		goto thread_cleanup;
+	} else {
+		//trace_printk("added pid %d, tid %d, ip: %lx, type %d\n", pid, tid, event->attr.config1, event->attr.bp_type);
+	}
 
 	target_event = create_lwfp_event(event, lwfp);
 	if (!target_event)
@@ -1662,6 +1824,7 @@ static int lwfp_event_init(struct perf_event *event)
 	process_node_put(proc_item);
 
 	event->destroy = lwfp_event_destroy;
+	//trace_printk("successfully create a new lwfp event\n");
 
 	return 0;
 
@@ -1682,7 +1845,7 @@ process_cleanup:
 
 	if (process_created)
 		remove_process(pid);
-
+	//trace_printk("final return value is %ld\n",ret);
 	return ret;
 }
 
@@ -1746,7 +1909,7 @@ int __init init_lwfp(void)
 	int ret;
 
 #if defined(CONFIG_KVM)
-	void *old_handler;
+void *old_handler;
 #endif
 
 	hash_init(lwfp_module);
