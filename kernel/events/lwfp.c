@@ -173,6 +173,7 @@ struct lwfp {
 
 	/* SGX-specific storage: kernel-owned copy of user data. */
 	struct perf_sgx_attr *sgx_attr;
+	int parent_data;
 
 	struct list_head node;
 	struct rcu_head rcu;
@@ -210,6 +211,7 @@ struct lwfp_event {
 	struct hlist_node node;
 	struct rcu_head rcu;
 	refcount_t refs;
+	int added;
 };
 
 struct lwfp_context {
@@ -270,8 +272,10 @@ static void lwfp_rcu_free(struct rcu_head *rcu)
 	struct lwfp *lwfp;
 
 	lwfp = container_of(rcu, struct lwfp, rcu);
-	kfree(lwfp->sgx_attr);
-	kfree(lwfp->attr);
+	if (lwfp->parent_data == 0) {
+		kfree(lwfp->sgx_attr);
+		kfree(lwfp->attr);
+	}
 	kfree(lwfp);
 }
 
@@ -417,7 +421,7 @@ static int lwfp_kvm_handle_flags(struct lwfp *lwfp,
 #else
 		return -EOPNOTSUPP;
 #endif
-		//trace_printk("KVM:done update vcpu ip\n");
+		trace_printk("KVM:done update vcpu ip\n");
 	}
 
 	if (flags & LWFP_FLAG_SINGLE_STEP) {
@@ -635,7 +639,7 @@ static int execute_event(struct lwfp *target,
 			struct pt_regs *regs,
 			struct lwfp_sgx_match_state *sgx_state)
 {
-	int flags;
+	unsigned long flags;
 
 	if (!target || !target->event || !regs)
 		return -1;
@@ -707,6 +711,7 @@ int lwfp_exceptions_notify(struct notifier_block *unused,
 				regs,
 				&sgx_state);
 	if (!lwfp) {
+		trace_printk("failed to find event\n");
 		return NOTIFY_DONE;
 	}
 
@@ -818,6 +823,42 @@ lwfp_get_process_node(pid_t pid)
 	return NULL;
 }
 
+static struct process_node *
+add_new_process(pid_t pid)
+{
+	struct process_node *proc_item;
+
+	proc_item = kzalloc(sizeof(*proc_item), GFP_ATOMIC);
+	if (!proc_item) return NULL;
+
+	proc_item->pid = pid;
+	spin_lock_init(&proc_item->thread_lock);
+	hash_init(proc_item->thread_hashtable);
+	refcount_set(&proc_item->refcount, 2);
+
+	hash_add_rcu(lwfp_module,
+		     &proc_item->node, pid);
+	return proc_item;
+}
+
+static struct thread_node * 
+add_new_thread(struct process_node *proc_item, pid_t tid)
+{
+	struct thread_node *thread;
+
+	thread = kzalloc(sizeof(*thread), GFP_ATOMIC);
+	if (!thread) return NULL;
+	
+	thread->tid = tid;
+	INIT_LIST_HEAD(&thread->lwfp_list);
+	spin_lock_init(&thread->lwfp_lock);
+	refcount_set(&thread->refcount, 2);
+
+	hash_add_rcu(proc_item->thread_hashtable,
+			&thread->node, tid);
+	return thread;
+}
+
 static int remove_process(pid_t pid)
 {
 	struct process_node *proc;
@@ -854,50 +895,6 @@ static int remove_process(pid_t pid)
 	return removed;
 }
 
-/*TODO: This is unused
-static struct thread_node *
-add_new_thread(struct process_node *node, pid_t tid)
-{
-	struct thread_node *new_thread;
-
-	new_thread = kzalloc(sizeof(*new_thread), GFP_KERNEL);
-	if (!new_thread)
-		return NULL;
-
-	new_thread->tid = tid;
-	INIT_LIST_HEAD(&new_thread->lwfp_list);
-	spin_lock_init(&new_thread->lwfp_lock);
-	refcount_set(&new_thread->refcount, 1);
-
-	spin_lock(&node->thread_lock);
-	hash_add_rcu(node->thread_hashtable, &new_thread->node, tid);
-	spin_unlock(&node->thread_lock);
-
-	return new_thread;
-}
-
-TODO: This is unused
-static struct process_node *
-add_new_process(pid_t pid)
-{
-	struct process_node *new_node;
-
-	new_node = kzalloc(sizeof(*new_node), GFP_KERNEL);
-	if (!new_node)
-		return NULL;
-
-	new_node->pid = pid;
-	spin_lock_init(&new_node->thread_lock);
-	hash_init(new_node->thread_hashtable);
-	refcount_set(&new_node->refcount, 1);
-
-	spin_lock(&lwfp_module_lock);
-	hash_add_rcu(lwfp_module, &new_node->node, pid);
-	spin_unlock(&lwfp_module_lock);
-
-	return new_node;
-}
-*/
 /*
  * Validate the SGX attribute structure referenced by
  * attr->context1.
@@ -936,6 +933,8 @@ static int validate_sgx_lwfp_attr(const struct perf_lwfp_attr *attr, struct perf
 	return 0;
 }
 
+
+
 /*
  * Allocate and populate a partial lwfp for an SGX probe: copies
  * perf_lwfp_attr from event_attr->config2, validates the referenced
@@ -950,7 +949,6 @@ handle_new_sgx_lwfp(const struct perf_event_attr *event_attr)
 	struct perf_sgx_attr *sgx_attr;
 	struct lwfp *lwfp;
 	void __user *user_attr;
-	void __user *user_sgx;
 	int ret;
 
 	if (!event_attr || !event_attr->config2) {
@@ -1008,8 +1006,27 @@ err_attr:
 	return ERR_PTR(ret);
 }
 
+static inline 
+void kick_not_current_thread(struct perf_event *event)
+{
+	pid_t ctid = task_pid_nr(current);
+	pid_t ttid = task_pid_nr(event->hw.target);
+
+	if (ctid != ttid) {
+		kick_process(event->hw.target);
+	}
+}
+
+static void
+add_event_to_thread(struct lwfp *lwfp, struct thread_node *target)
+{
+	spin_lock(&target->lwfp_lock);
+	list_add_rcu(&lwfp->node, &target->lwfp_list);
+	spin_unlock(&target->lwfp_lock);
+}
+
 static struct lwfp *
-add_new_lwfp(struct perf_event *event, struct thread_node *target)
+add_new_lwfp(struct perf_event *event)
 {
 	struct lwfp_saved_attr attr = {0};
 	unsigned long count;
@@ -1017,85 +1034,44 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 	struct perf_lwfp_attr *lwfp_attr;
 	struct perf_sgx_attr *sgx_attr;
 	void *ret;
+	struct lwfp_saved_attr *saved;
 	int needs_copy = 0;
 
 	if (event->attr.bp_type == LWFP_TYPE_EXTENDED ||
 		event->attr.bp_type == LWFP_TYPE_SGX  ||
-		event->attr.bp_type == LWFP_TYPE_VM )
-	{
+		event->attr.bp_type == LWFP_TYPE_VM ) {
 		needs_copy = 1;
 	}
 
 	if ( needs_copy && event->parent && event->parent->pmu_private) {
-
-		if (event->pmu_private != NULL) {
-			//trace_printk("pmu private is not NULL\n");
-			return NULL;
-		}
+		if (event->pmu_private != NULL) return NULL;
 
 		ret = memcpy(&attr, event->parent->pmu_private, sizeof(struct lwfp_saved_attr));
-		if (ret != &attr) {
-			//trace_printk("failed attr copy\n");
-			return NULL;
-		}
+		if (ret != &attr) return NULL;
 
 		lwfp = kzalloc(sizeof(struct lwfp), GFP_KERNEL);
-		if (!lwfp) {
-			//trace_printk("failed lwfp alloc\n");
-			return NULL;
-		}
+		if (!lwfp) return NULL;
 
-		lwfp_attr = kzalloc(sizeof(struct perf_lwfp_attr), GFP_KERNEL);
-		if (!lwfp_attr) {
-			//trace_printk("failed lwfp attr\n");
-			goto error_lwfp;
-		}
-
-		ret = memcpy(lwfp_attr, &attr.lwfp_attr, sizeof(struct perf_lwfp_attr));
-		if (ret != lwfp_attr) {
-			//trace_printk("lwfp attr failed copy\n");
-			goto error_lwfp_attr;
-		}
-
-		if (event->attr.bp_type == LWFP_TYPE_SGX) {
-			sgx_attr = kzalloc(sizeof(struct perf_sgx_attr), GFP_KERNEL);
-			if (!sgx_attr) {
-				//trace_printk("failed sgx_attr \n");
-				goto error_lwfp_attr;
-			}
-
-			memcpy(sgx_attr, &attr.sgx_attr, sizeof(struct perf_sgx_attr));
-		}
-
-		event->pmu_private = kzalloc(sizeof(struct lwfp_saved_attr), GFP_KERNEL);
-		if (!event->pmu_private) {
-			//trace_printk("failed alloc pmu private\n");
-			goto error_sgx_attr;
-		}
-
-		memcpy(event->pmu_private, &attr, sizeof(struct lwfp_saved_attr));
-		lwfp->sgx_attr = sgx_attr;
-		lwfp->attr = lwfp_attr;
+		saved = event->parent->pmu_private;
+		lwfp->sgx_attr = &saved->sgx_attr;
+		lwfp->attr = &saved->lwfp_attr;
+		lwfp->parent_data = 1;
 
 	} else {
-		if (event->attr.bp_type == LWFP_TYPE_SGX) {
-			//trace_printk("adding LWFP_TYPE_SGX \n");
+		if (event->attr.bp_type == LWFP_TYPE_SGX) { //trace_printk("adding LWFP_TYPE_SGX \n");
 			lwfp = handle_new_sgx_lwfp(&event->attr);
-			if (IS_ERR(lwfp)) {
-				//trace_printk("failed handling lwfp attributes 0x%llx\n", lwfp);
+			if (IS_ERR(lwfp)) { //trace_printk("failed handling lwfp attributes 0x%llx\n", lwfp);
 				return NULL;
 			}
 		} else {
 			lwfp = kzalloc(sizeof(*lwfp), GFP_KERNEL);
-			if (!lwfp){
-				//trace_printk("failed 2 lwfp alloc\n");
+			if (!lwfp){ //trace_printk("failed 2 lwfp alloc\n");
 				return NULL;
 			}
 
 			if (event->attr.bp_type == LWFP_TYPE_VM ||
 			    event->attr.bp_type == LWFP_TYPE_EXTENDED) {
-				if (!event->attr.config2) {
-					//trace_printk("event attr config2\n");
+				if (!event->attr.config2) { //trace_printk("event attr config2\n");
 					goto error_attr_alloc;
 				}
 
@@ -1112,15 +1088,14 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 					goto error_copy;
 			}
 		}
+
 		if (needs_copy) {
-			if (event->pmu_private != NULL) {
-				//trace_printk("pmu private is not NULL for a new event!\n");
+			if (event->pmu_private != NULL) { //trace_printk("pmu private is not NULL for a new event!\n");
 				goto error_copy;
 			}
 
 			event->pmu_private = kzalloc(sizeof(struct lwfp_saved_attr), GFP_KERNEL);
-			if (!event->pmu_private) 
-				goto error_copy;
+			if (!event->pmu_private) goto error_copy;
 
 			if (lwfp->sgx_attr) {
 				sgx_attr = (struct perf_sgx_attr*) &(((struct lwfp_saved_attr*)event->pmu_private)->sgx_attr);
@@ -1136,17 +1111,15 @@ add_new_lwfp(struct perf_event *event, struct thread_node *target)
 	lwfp->config2 = event->attr.config2;
 	lwfp->type = event->attr.bp_type;
 	lwfp->o_pid = task_tgid_nr(current);
-	lwfp->t_pid = task_tgid_nr(event->hw.target);
-	lwfp->t_tid = task_pid_nr(event->hw.target);
+	lwfp->t_pid = task_tgid_nr(current);
+	lwfp->t_tid = task_pid_nr(current);
 	lwfp->event = event;
 	lwfp->removed = false;
 	refcount_set(&lwfp->refs, 1);
 
-	spin_lock(&target->lwfp_lock);
-	list_add_rcu(&lwfp->node, &target->lwfp_list);
-	spin_unlock(&target->lwfp_lock);
-	//trace_printk("created a new lwfp of type %d pid: %d tid: %d\n", event->attr.bp_type, lwfp->t_pid, lwfp->t_tid);
 
+	//trace_printk("created a new lwfp of type %d pid: %d tid: %d\n", event->attr.bp_type, lwfp->t_pid, lwfp->t_tid);
+	//kick_not_current_thread(event);	
 	return lwfp;
 
 error_copy:
@@ -1155,14 +1128,6 @@ error_copy:
 error_attr_alloc:
 	kfree(lwfp);
 
-	return NULL;
-
-error_sgx_attr:
-		kfree(sgx_attr);
-error_lwfp_attr:
-		kfree(lwfp_attr);
-error_lwfp:
-		kfree(lwfp);
 	return NULL;
 }
 
@@ -1178,9 +1143,40 @@ create_lwfp_event(struct perf_event *event,
 
 	new_node->event = event;
 	new_node->value = lwfp;
+	new_node->added = 0;
 	refcount_set(&new_node->refs, 1);
 
 	return new_node;
+}
+
+static struct lwfp_event *
+search_for_lwfp_current(struct perf_event *event)
+{
+	struct lwfp_event *target_event;
+	pid_t pid; 
+	pid_t tid;
+
+	pid = task_tgid_nr(current);
+	tid = task_pid_nr(current);
+
+	rcu_read_lock();
+
+	hash_for_each_possible_rcu(events_table,
+				   target_event,
+				   node,
+				   (unsigned long)event) {
+		if (target_event->event == event &&
+			target_event->value->t_tid == tid &&
+			target_event->value->t_pid == pid &&
+		    refcount_inc_not_zero(&target_event->refs)) {
+			rcu_read_unlock();
+			return target_event;
+		}
+	}
+
+	rcu_read_unlock();
+
+	return NULL;
 }
 
 static struct lwfp_event *
@@ -1210,8 +1206,11 @@ static inline int
 lwfp_match_extended(struct lwfp *lwfp,
 		    struct pt_regs *regs)
 {
-	return lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL,
+	int ret;
+	ret = lwfp_match_regs_attr(lwfp ? lwfp->attr : NULL,
 				    regs);
+	trace_printk("return value: %d matching extended for rip %lx, rbx %lx",ret, regs->ip, regs->bx);
+	return ret;
 }
 
 static inline int
@@ -1353,6 +1352,7 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	pid_t tid;
 	int found = 0;
 	int ret;
+	unsigned long flags;
 
 	if (orig_ret < 0 || !vcpu || !regs)
 		return orig_ret;
@@ -1368,21 +1368,21 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	pid = task_tgid_nr(current);
 	tid = task_pid_nr(current);
 
-	//trace_printk("KVM_EXIT_DEBUG pid: %d tid: %d\n", pid, tid);
+	trace_printk("KVM_EXIT_DEBUG pid: %d tid: %d\n", pid, tid);
 
 	proc_item = lwfp_get_process_node(pid);
 	if (!proc_item) {
-		//trace_printk("process item not found\n");
+		trace_printk("process item not found\n");
 		return orig_ret;
 	}
 
 	thread_item = lwfp_get_thread_node(proc_item, tid);
 	if (!thread_item) {
-		//trace_printk("thread item not found\n");
+		trace_printk("thread item not found\n");
 		process_node_put(proc_item);
 		return orig_ret;
 	}
-	//trace_printk("vcpu ip is 0x%lx\n", instruction_pointer(regs));
+	trace_printk("vcpu ip is 0x%lx\n", instruction_pointer(regs));
 
 	rcu_read_lock();
 
@@ -1416,7 +1416,6 @@ int lwfp_handle_kvm_exception_context(struct kvm_vcpu *vcpu,
 	}
 
 	//trace_printk("KVM: handling KVM_EXIT_DEBUG with perf_bp_event\n");
-	unsigned long flags;
 	local_irq_save(flags);
 	perf_bp_event(lwfp->event, regs);
 	local_irq_restore(flags);
@@ -1556,20 +1555,20 @@ search_for_event(pid_t pid,
 
 	proc_item = lwfp_get_process_node(pid);
 	if (!proc_item) {
-		//trace_printk("process not found\n");
+		trace_printk("process not found %d\n", pid);
 		return NULL;
 	}
 
 	thread_item = lwfp_get_thread_node(proc_item, tid);
 	if (!thread_item) {
 		process_node_put(proc_item);
-		//trace_printk("thread not found pid: %d tid %d rip:%p bx: %llx\n", pid, tid, regs->ip, regs->bx);
+		trace_printk("thread not found pid: %d tid %d rip:%lx bx: %lx\n", pid, tid, regs->ip, regs->bx);
 		return NULL;
 	}
 
 	rcu_read_lock();
 
-//	//trace_printk("searching for event pid %d:tid %d , ip: %lx\n",pid,tid,regs->ip);
+	trace_printk("searching for event pid %d:tid %d , ip: %lx\n",pid,tid,regs->ip);
 	list_for_each_entry_rcu(lwfp,
 				&thread_item->lwfp_list,
 				node) {
@@ -1589,6 +1588,7 @@ search_for_event(pid_t pid,
 			break;
 
 		case LWFP_TYPE_EXTENDED:
+			trace_printk("lwfp matching type extended\n");
 			if (instruction_pointer(regs) != lwfp->config1)
 				continue;
 
@@ -1623,7 +1623,7 @@ search_for_event(pid_t pid,
 
 	if (found > 0 && !refcount_inc_not_zero(&lwfp->refs))
 		found = 0;
-	//trace_printk("found lwfp of type %d\n", lwfp->type);
+	trace_printk("found lwfp of type %d\n", lwfp->type);
 
 	rcu_read_unlock();
 
@@ -1645,59 +1645,110 @@ static void lwfp_event_destroy(struct perf_event *event)
 	pid_t pid;
 	pid_t tid;
 
-	bp_event = search_for_lwfp(event);
-	if (!bp_event)
-		return;
-
-	lwfp = bp_event->value;
-	if (!lwfp || !refcount_inc_not_zero(&lwfp->refs)) {
+	while ( (bp_event = search_for_lwfp(event)) ) {
+		if (!bp_event)
+			break;
+		//trace_printk("destroying event %p pid %d tid %d\n",bp_event, task_tgid_nr(current), task_pid_nr(current));
+		lwfp = bp_event->value;
+		if (!lwfp || !refcount_inc_not_zero(&lwfp->refs)) {
+			lwfp_event_put(bp_event);
+			continue;
+		}
+	
+		pid = lwfp->t_pid;
+		tid = lwfp->t_tid;
+	
+		spin_lock(&events_lock);
+	
+		if (!hlist_unhashed(&bp_event->node))
+			hash_del_rcu(&bp_event->node);
+	
+		spin_unlock(&events_lock);
+	
+		lwfp_put(lwfp);
+	
+		proc_item = lwfp_get_process_node(pid);
+		if (proc_item) {
+			thread = lwfp_get_thread_node(proc_item, tid);
+	
+			if (thread) {
+				remove_and_free_lwfp(thread, lwfp);
+	
+				spin_lock(&thread->lwfp_lock);
+	
+				if (list_empty(&thread->lwfp_list))
+					remove_thread(proc_item, thread);
+	
+				spin_unlock(&thread->lwfp_lock);
+	
+				thread_node_put(thread);
+			}
+	
+			if (unlink_empty_process(proc_item))
+				process_node_put(proc_item);
+	
+			process_node_put(proc_item);
+		}
+	
+		lwfp_put(lwfp);
+	
 		lwfp_event_put(bp_event);
-		return;
+		if (event->pmu_private) {
+			kfree(event->pmu_private);
+		}
 	}
+	return;
+}
 
-	pid = lwfp->t_pid;
-	tid = lwfp->t_tid;
+struct process_node *
+get_process(pid_t pid) {
+	struct process_node *proc_item;
+
+	spin_lock(&lwfp_module_lock);
+	hash_for_each_possible(lwfp_module, proc_item, node, pid) {
+		if (proc_item->pid == pid) {
+			refcount_inc(&proc_item->refcount);
+			break;
+		}
+	}
+	spin_unlock(&lwfp_module_lock);
+	return proc_item;
+}
+
+static int 
+add_lwfp_to_events_table(struct perf_event *event, struct lwfp_event *target_event, struct lwfp *lwfp)
+{
+	struct lwfp_event *existing_event;
+	pid_t pid;
+	pid_t tid;
+
+	pid = task_tgid_nr(current);
+	tid = task_pid_nr(current);
+
+	if (!event || !target_event || !lwfp)
+		return -EINVAL;
 
 	spin_lock(&events_lock);
 
-	if (!hlist_unhashed(&bp_event->node))
-		hash_del_rcu(&bp_event->node);
+	hash_for_each_possible(events_table,
+			       existing_event,
+			       node,
+			       (unsigned long)event) {
+		if (existing_event->event == event &&
+			existing_event->value->t_tid == tid &&
+			existing_event->value->t_pid == pid) {
+			spin_unlock(&events_lock);
+			return -EEXIST;
+		}
+	}
+
+	hash_add_rcu(events_table,
+		     &target_event->node,
+		     (unsigned long)event);
+	refcount_inc(&lwfp->refs);//reference to lwfp containing target eventj
 
 	spin_unlock(&events_lock);
-
-	lwfp_put(lwfp);
-
-	proc_item = lwfp_get_process_node(pid);
-	if (proc_item) {
-		thread = lwfp_get_thread_node(proc_item, tid);
-
-		if (thread) {
-			remove_and_free_lwfp(thread, lwfp);
-
-			spin_lock(&thread->lwfp_lock);
-
-			if (list_empty(&thread->lwfp_list))
-				remove_thread(proc_item, thread);
-
-			spin_unlock(&thread->lwfp_lock);
-
-			thread_node_put(thread);
-		}
-
-		if (unlink_empty_process(proc_item))
-			process_node_put(proc_item);
-
-		process_node_put(proc_item);
-	}
-
-	lwfp_put(lwfp);
-
-	lwfp_event_put(bp_event);
-	if (event->pmu_private) {
-		kfree(event->pmu_private);
-	}
-
-	return;
+	return 1;
 }
 
 static int lwfp_event_init(struct perf_event *event)
@@ -1705,7 +1756,6 @@ static int lwfp_event_init(struct perf_event *event)
 	struct process_node *proc_item = NULL;
 	struct thread_node *thread = NULL;
 	struct lwfp_event *target_event = NULL;
-	struct lwfp_event *existing_event;
 	struct lwfp *lwfp = NULL;
 	bool process_created = false;
 	bool thread_created = false;
@@ -1713,7 +1763,8 @@ static int lwfp_event_init(struct perf_event *event)
 	pid_t tid;
 	int ret = -EINVAL;
 
-	//trace_printk("create new event parent: %p event: %p pmu:%p\n", event->parent, event, event->pmu_private);
+	//trace_printk("create new event parent: %p event: %p pmu:%p\n",
+	//event->parent, event, event->pmu_private);
 	if (event->attr.type != PERF_TYPE_LWFP)
 		return -ENOENT;
 
@@ -1722,33 +1773,22 @@ static int lwfp_event_init(struct perf_event *event)
 	     event->attr.bp_type == LWFP_TYPE_EXTENDED) &&
 	    event->attr.config2 == 0)
 		return -EINVAL;
+//	trace_printk("create new event pid %d: tid %d\n",task_tgid_nr(current), task_pid_nr(current));
 
-	pid = task_tgid_nr(event->hw.target);
-	tid = task_pid_nr(event->hw.target);
+	pid = task_tgid_nr(current);
+	tid = task_pid_nr(current);
 
-	//trace_printk("create new event for pid %d tid %d config1 %llx config2 %llx\n",pid ,tid, event->attr.config1, event->attr.config2);
+	trace_printk("create new event for pid %d tid %d config1 %llx config2 %llx\n",
+			pid ,tid, event->attr.config1, event->attr.config2);
+
+
+	proc_item = get_process(pid);
+
 	spin_lock(&lwfp_module_lock);
 
-	hash_for_each_possible(lwfp_module, proc_item, node, pid) {
-		if (proc_item->pid == pid) {
-			refcount_inc(&proc_item->refcount);
-			break;
-		}
-	}
-
 	if (!proc_item) {
-		proc_item = kzalloc(sizeof(*proc_item), GFP_ATOMIC);
-		if (proc_item) {
-			proc_item->pid = pid;
-			spin_lock_init(&proc_item->thread_lock);
-			hash_init(proc_item->thread_hashtable);
-			refcount_set(&proc_item->refcount, 2);
-
-			hash_add_rcu(lwfp_module,
-				     &proc_item->node,
-				     pid);
-			process_created = true;
-		}
+		proc_item = add_new_process(pid);
+		if (proc_item) process_created = true;
 	}
 
 	spin_unlock(&lwfp_module_lock);
@@ -1769,18 +1809,8 @@ static int lwfp_event_init(struct perf_event *event)
 	}
 
 	if (!thread) {
-		thread = kzalloc(sizeof(*thread), GFP_ATOMIC);
-		if (thread) {
-			thread->tid = tid;
-			INIT_LIST_HEAD(&thread->lwfp_list);
-			spin_lock_init(&thread->lwfp_lock);
-			refcount_set(&thread->refcount, 2);
-
-			hash_add_rcu(proc_item->thread_hashtable,
-				     &thread->node,
-				     tid);
-			thread_created = true;
-		}
+		thread = add_new_thread(proc_item, tid);
+		if (thread) thread_created = true;
 	}
 
 	spin_unlock(&proc_item->thread_lock);
@@ -1788,37 +1818,23 @@ static int lwfp_event_init(struct perf_event *event)
 	if (!thread)
 		goto process_cleanup;
 
-	lwfp = add_new_lwfp(event, thread);
+	lwfp = add_new_lwfp(event);
 	if (!lwfp) {
 		//trace_printk("failed to add new lwfp\n");
 		goto thread_cleanup;
 	} else {
-		//trace_printk("added pid %d, tid %d, ip: %lx, type %d\n", pid, tid, event->attr.config1, event->attr.bp_type);
+		trace_printk("added pid %d, tid %d, ip: %llx, type %d\n",
+				pid, tid, event->attr.config1, event->attr.bp_type);
 	}
+//HERE WE ARE TO FIX THIS ISSUE!
+	add_event_to_thread(lwfp, thread);//add event to thread --> do this in add
 
 	target_event = create_lwfp_event(event, lwfp);
 	if (!target_event)
 		goto lwfp_cleanup;
 
-	spin_lock(&events_lock);
-
-	hash_for_each_possible(events_table,
-			       existing_event,
-			       node,
-			       (unsigned long)event) {
-		if (existing_event->event == event) {
-			spin_unlock(&events_lock);
-			ret = -EEXIST;
-			goto event_cleanup;
-		}
-	}
-
-	hash_add_rcu(events_table,
-		     &target_event->node,
-		     (unsigned long)event);
-	refcount_inc(&lwfp->refs);
-
-	spin_unlock(&events_lock);
+	ret = add_lwfp_to_events_table(event, target_event, lwfp);
+	if (ret < 0) goto event_cleanup;
 
 	thread_node_put(thread);
 	process_node_put(proc_item);
@@ -1849,15 +1865,81 @@ process_cleanup:
 	return ret;
 }
 
-static int lwfp_add(struct perf_event *event,
-		    int flags)
+static int lwfp_add(struct perf_event *event, int flags)
 {
+	struct lwfp_event *lwfp_event;
+	struct lwfp *lwfp;
+	struct process_node *proc;
+	struct thread_node *thread;
+	pid_t pid;
+	pid_t tid;
+	int ret;
+
+	pid = task_tgid_nr(current);
+	tid = task_pid_nr(current);
+
+	//trace_printk("add event %p pid: %d tid: %d\n", event, pid, tid);
+
+	lwfp_event = search_for_lwfp_current(event);
+	if (lwfp_event && lwfp_event->added) {
+		ret = 0;
+		goto lwfp_add_end;
+	}
+
+	if (lwfp_event) {
+		lwfp_event->added = 1;
+		lwfp_event_put(lwfp_event);
+		return 0;
+	}
+
+	proc = lwfp_get_process_node(pid);
+	if (!proc) {
+		ret = -ENOENT;
+		goto no_proc_node;
+	}
+
+	thread =  lwfp_get_thread_node(proc, tid);
+	
+	if(!thread) /*add thread*/
+		thread = add_new_thread(proc, tid); 
+
+	if (!thread) {
+		ret = -ENOMEM;
+		goto thread_fail;
+	}
+	if (!lwfp_event) {
+		lwfp = add_new_lwfp(event);
+		ret = -ENOMEM;
+		if(!lwfp) goto lwfp_fail;
+		lwfp_event = create_lwfp_event(event, lwfp);
+		add_lwfp_to_events_table(event, lwfp_event, lwfp);
+	}
+	
+	add_event_to_thread(lwfp, thread);
+
+	process_node_put(proc);
+	thread_node_put(thread);
 	return 0;
+lwfp_fail:
+	thread_node_put(thread);
+thread_fail:
+	process_node_put(proc);
+no_proc_node:
+	lwfp_event_put(lwfp_event);
+lwfp_add_end:
+	return ret;
 }
 
 static void lwfp_del(struct perf_event *event,
 		     int flags)
 {
+	pid_t pid;
+	pid_t tid;
+
+	pid = task_tgid_nr(current);
+	tid = task_pid_nr(current);
+
+	//trace_printk("delete event %p pid: %d tid: %d\n", event, pid, tid);
 }
 
 static void lwfp_start(struct perf_event *event,
