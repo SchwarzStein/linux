@@ -40,6 +40,7 @@
 #include <linux/atomic.h>
 #include <linux/mm.h>
 #include <linux/mmap_lock.h>
+#include <linux/lwfp.h>
 
 #include <asm/ptrace.h>
 #include <linux/kvm_host.h>
@@ -361,14 +362,15 @@ lwfp_match_regs_attr(const struct perf_lwfp_attr *attr,
 }
 
 static int lwfp_extended_handle_flags(struct lwfp *lwfp,
-				      struct pt_regs *regs)
+				      struct pt_regs *regs,
+				      u64 supported_flags)
 {
 	u64 flags;
 
 	if (!lwfp || !lwfp->attr || !regs)
 		return -EINVAL;
 
-	flags = lwfp->attr->flags;
+	flags = lwfp->attr->flags & supported_flags;
 
 	if (flags & LWFP_FLAG_IP_INC)
 		instruction_pointer_set(regs,
@@ -597,7 +599,7 @@ lwfp_handle_flags(struct lwfp *lwfp,
 
 	switch (lwfp->type) {
 	case LWFP_TYPE_EXTENDED:
-		return lwfp_extended_handle_flags(lwfp, regs);
+		return lwfp_extended_handle_flags(lwfp, regs, ~0ULL);
 
 	case LWFP_TYPE_VM:
 		return lwfp_kvm_handle_flags(lwfp, vcpu, regs);
@@ -1212,6 +1214,48 @@ lwfp_match_extended(struct lwfp *lwfp,
 	trace_printk("return value: %d matching extended for rip %lx, rbx %lx",ret, regs->ip, regs->bx);
 	return ret;
 }
+
+int lwfp_report_extended_event(struct pt_regs *regs, u64 supported_flags)
+{
+	struct process_node *proc;
+	struct thread_node *thread;
+	struct lwfp *lwfp;
+	unsigned long irq_flags;
+	int ret = 0;
+
+	if (!regs)
+		return -EINVAL;
+
+	proc = lwfp_get_process_node(task_tgid_nr(current));
+	if (!proc)
+		return 0;
+
+	thread = lwfp_get_thread_node(proc, task_pid_nr(current));
+	if (!thread)
+		goto out_proc;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(lwfp, &thread->lwfp_list, node) {
+		if (lwfp->type != LWFP_TYPE_EXTENDED ||
+		    instruction_pointer(regs) != lwfp->config1 ||
+		    !lwfp_match_extended(lwfp, regs))
+			continue;
+
+		local_irq_save(irq_flags);
+		perf_bp_event(lwfp->event, regs);
+		local_irq_restore(irq_flags);
+		ret = lwfp_extended_handle_flags(lwfp, regs, supported_flags);
+		if (!ret)
+			ret = 1;
+		break;
+	}
+	rcu_read_unlock();
+	thread_node_put(thread);
+out_proc:
+	process_node_put(proc);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(lwfp_report_extended_event);
 
 static inline int
 lwfp_match_vm(struct lwfp *lwfp,
